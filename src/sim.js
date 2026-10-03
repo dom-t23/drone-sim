@@ -116,13 +116,159 @@ export function autopilot(drone, course, state) {
   return v3.add(aDes, [0, G, 0]); // desired specific thrust
 }
 
+// ---------- racing line ----------
+// Plan a smooth closed path through every gate centre, crossing each gate square-on,
+// then give it a speed profile the airframe can actually fly.
+export const RACING = {
+  ds: 0.25, // path sample spacing, m
+  tangentScale: 1.15, // Hermite tangent length as a fraction of the gate-to-gate distance
+  turnMargin: 0.75, // fraction of the tilt/thrust envelope the planned turns may use
+  aAccel: 7.0, // m/s^2 budget for speeding up along the path
+  aBrake: 9.0, // m/s^2 budget for braking along the path
+  vMax: 32, // m/s top speed
+  kp: 7.0, // 1/s^2, position error gain
+  kd: 4.5, // 1/s, velocity error gain
+  launchRate: 9, // m/s per second the speed cap rises at from a standstill
+};
+
+// Cubic Hermite point and derivatives on [0, 1].
+function hermite(p0, m0, p1, m1, u) {
+  const u2 = u * u, u3 = u2 * u;
+  const h00 = 2 * u3 - 3 * u2 + 1, h10 = u3 - 2 * u2 + u, h01 = -2 * u3 + 3 * u2, h11 = u3 - u2;
+  const d00 = 6 * u2 - 6 * u, d10 = 3 * u2 - 4 * u + 1, d01 = -6 * u2 + 6 * u, d11 = 3 * u2 - 2 * u;
+  const e00 = 12 * u - 6, e10 = 6 * u - 4, e01 = -12 * u + 6, e11 = 6 * u - 2;
+  const mix = (a, b, c, d) => [0, 1, 2].map((k) => a * p0[k] + b * m0[k] + c * p1[k] + d * m1[k]);
+  return { p: mix(h00, h10, h01, h11), d1: mix(d00, d10, d01, d11), d2: mix(e00, e10, e01, e11) };
+}
+
+export function planRacingLine(course, opts = {}) {
+  const P = { ...RACING, ...opts };
+  const gates = course.gates;
+  const n = gates.length;
+  const pts = []; // {p, s, gate} — gate is set on the sample at each gate centre
+  // dense parameter sampling per segment, then resample to even arc length
+  const raw = [];
+  for (let i = 0; i < n; i++) {
+    const a = gates[i], b = gates[(i + 1) % n];
+    const L = v3.len(v3.sub(b.pos, a.pos)) * P.tangentScale;
+    const m0 = v3.scale(a.normal, L), m1 = v3.scale(b.normal, L);
+    const steps = 400;
+    for (let k = 0; k < steps; k++) raw.push({ p: hermite(a.pos, m0, b.pos, m1, k / steps).p, gate: k === 0 ? i : -1 });
+  }
+  // cumulative length of the raw polyline
+  const rawS = [0];
+  for (let i = 1; i <= raw.length; i++) rawS.push(rawS[i - 1] + v3.len(v3.sub(raw[i % raw.length].p, raw[i - 1].p)));
+  const total = rawS[raw.length];
+  const N = Math.max(8, Math.round(total / P.ds));
+  const ds = total / N;
+  let j = 0;
+  const gateS = gates.map((_, i) => rawS[raw.findIndex((r) => r.gate === i)]);
+  for (let k = 0; k < N; k++) {
+    const s = k * ds;
+    while (rawS[j + 1] < s) j++;
+    const f = (s - rawS[j]) / (rawS[j + 1] - rawS[j] || 1);
+    const q0 = raw[j].p, q1 = raw[(j + 1) % raw.length].p;
+    pts.push({ p: v3.add(q0, v3.scale(v3.sub(q1, q0), f)), s });
+  }
+  // tangent and curvature vector from central differences (closed loop)
+  for (let k = 0; k < N; k++) {
+    const a = pts[(k - 1 + N) % N].p, b = pts[k].p, c = pts[(k + 1) % N].p;
+    pts[k].t = v3.norm(v3.sub(c, a));
+    // second difference / ds^2 = curvature vector (points towards the turn centre)
+    pts[k].kv = v3.scale(v3.add(v3.sub(a, v3.scale(b, 2)), c), 1 / (ds * ds));
+  }
+  // speed profile: turn limit, then forward (accel) and backward (brake) passes, twice round the loop
+  const v = pts.map((q) => turnSpeedLimit(q.kv, P));
+  for (let pass = 0; pass < 2; pass++) {
+    for (let k = 1; k <= N; k++) {
+      const i = k % N, h = k - 1;
+      v[i] = Math.min(v[i], Math.sqrt(v[h] * v[h] + 2 * P.aAccel * ds));
+    }
+    for (let k = N - 1; k >= 0; k--) {
+      const i = k, nx = (k + 1) % N;
+      v[i] = Math.min(v[i], Math.sqrt(v[nx] * v[nx] + 2 * P.aBrake * ds));
+    }
+  }
+  // along-track acceleration implied by the profile: dv/dt = v dv/ds
+  for (let k = 0; k < N; k++) {
+    pts[k].v = v[k];
+    const vn = v[(k + 1) % N], vp = v[(k - 1 + N) % N];
+    pts[k].at = (v[k] * (vn - vp)) / (2 * ds);
+  }
+  const lapTime = v.reduce((sum, x) => sum + ds / x, 0);
+  return { pts, ds, length: total, gateS, lapTime, params: P };
+}
+
+// Fastest speed at which the turn at curvature vector kv fits inside the airframe's
+// envelope (tilt limit and max thrust), scaled by a safety margin. Diving turns are
+// limited hardest because less vertical thrust means less sideways force at max tilt.
+function turnFeasible(kv, v, P) {
+  const a = v3.scale(kv, v * v);
+  const ty = (a[1] + G) * P.turnMargin; // vertical thrust available
+  const th = Math.hypot(a[0], a[2]);
+  if (ty <= 0) return th < 1e-6 && a[1] + G >= 0;
+  return th <= ty * Math.tan(DRONE.maxTiltRad) && Math.hypot(th, a[1] + G) <= DRONE.maxThrustAcc * P.turnMargin;
+}
+function turnSpeedLimit(kv, P) {
+  if (turnFeasible(kv, P.vMax, P)) return P.vMax;
+  let lo = 0, hi = P.vMax;
+  for (let i = 0; i < 24; i++) {
+    const mid = (lo + hi) / 2;
+    if (turnFeasible(kv, mid, P)) lo = mid; else hi = mid;
+  }
+  return lo;
+}
+
+// Find the closest path sample, searching a window around the last one so the
+// tracker never jumps to a different part of the course.
+function nearestIndex(plan, pos, from, back = 20, fwd = 160) {
+  const N = plan.pts.length;
+  let best = from, bestD = Infinity;
+  for (let o = -back; o <= fwd; o++) {
+    const k = (from + o + N) % N;
+    const q = plan.pts[k].p;
+    const d = (q[0] - pos[0]) ** 2 + (q[1] - pos[1]) ** 2 + (q[2] - pos[2]) ** 2;
+    if (d < bestD) { bestD = d; best = k; }
+  }
+  return best;
+}
+
+// Track the racing line: feedforward from the path (centripetal + along-track
+// acceleration + drag), plus PD on position and velocity error.
+export function racingPilot(sim) {
+  const { drone, plan, track } = sim;
+  const P = plan.params;
+  const N = plan.pts.length;
+  track.idx = nearestIndex(plan, drone.pos, track.idx);
+  // look a little ahead to make up for the thrust lag
+  const speed = v3.len(drone.vel);
+  const ahead = Math.round((speed * DRONE.thrustLag) / plan.ds);
+  const q = plan.pts[track.idx];
+  const qa = plan.pts[(track.idx + ahead) % N];
+  const cap = 3 + P.launchRate * sim.t; // gentle launch from a standstill
+  const vRef = Math.min(qa.v, cap);
+  const atRef = vRef < qa.v ? Math.min(P.aAccel, P.launchRate) : qa.at;
+  const velRef = v3.scale(qa.t, vRef);
+  let a = v3.add(v3.scale(qa.kv, vRef * vRef), v3.scale(qa.t, atRef));
+  a = v3.add(a, v3.scale(velRef, DRONE.drag));
+  a = v3.add(a, v3.scale(v3.sub(q.p, drone.pos), P.kp));
+  a = v3.add(a, v3.scale(v3.sub(velRef, drone.vel), P.kd));
+  return v3.add(a, [0, G, 0]);
+}
+
 // ---------- simulation ----------
-export function makeSim({ seed = 1, gates = 10 } = {}) {
+export const PILOTS = ['racing', 'pursuit'];
+
+export function makeSim({ seed = 1, gates = 10, pilot = 'racing' } = {}) {
   const course = makeCourse({ seed, gates });
   const drone = makeDrone(course);
+  const plan = planRacingLine(course);
   return {
     course,
     drone,
+    pilot,
+    plan,
+    track: { idx: nearestIndex(plan, drone.pos, 0, 0, plan.pts.length) },
     t: 0,
     state: { target: 0, gatesPassed: 0, misses: 0, lap: 0, lapStart: null, laps: [] },
     events: [],
@@ -131,7 +277,8 @@ export function makeSim({ seed = 1, gates = 10 } = {}) {
 
 export function step(sim, dt) {
   const { drone, course, state } = sim;
-  const cmd = limitThrust(autopilot(drone, course, state));
+  const want = sim.pilot === 'pursuit' ? autopilot(drone, course, state) : racingPilot(sim);
+  const cmd = limitThrust(want);
 
   // first-order lag towards the commanded thrust
   const k = Math.min(1, dt / DRONE.thrustLag);

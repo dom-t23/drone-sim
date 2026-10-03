@@ -4,7 +4,8 @@ A rough backlog, not a contract. Each night picks the item that will make the bi
 
 ## Flying
 - [ ] **Harder courses.** Tighter turns, big height changes, dive gates, a split-S, gates at an angle. Add a difficulty selector and a shareable seed in the URL (`#seed=12&d=hard`).
-- [ ] **Faster autopilot.** Plan the racing line through upcoming gates (e.g. minimum-snap or time-optimal-ish splines) instead of axis pursuit, and track it with a proper attitude/thrust controller. Show the planned path.
+- [x] **Faster autopilot.** Racing line (Hermite spline through gate centres plus an envelope-aware speed profile) tracked with feedforward + PD, shown on the course. 27.3 s → 17.6 s a lap (2026-10-03).
+  - **Next steps:** optimise the gate crossing points within each opening and the tangent lengths (e.g. a few rounds of coordinate descent on planned lap time) instead of always aiming at the centre; couple the turn and acceleration budgets (a friction-circle style limit) so the profile can be pushed harder; then try minimum-snap. Retighten the lap-time test after each gain.
 - [ ] **Wind and disturbances.** Gusts, sensor noise, motor lag variation; the autopilot must stay robust.
 - [ ] **Crashes.** Gate-frame and pillar collisions, with a tumble and respawn.
 

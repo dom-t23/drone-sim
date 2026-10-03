@@ -50,7 +50,7 @@ let camMode = 'chase'; // chase | orbit | fpv
 const CAM_MODES = ['chase', 'orbit', 'fpv'];
 
 // ---------- world objects (rebuilt per course) ----------
-let sim, seed = 1, world = new THREE.Group();
+let sim, seed = 1, pilot = 'racing', world = new THREE.Group(), racingLine = null;
 scene.add(world);
 
 const gateMatIdle = new THREE.MeshStandardMaterial({ color: '#d9e2ef', roughness: 0.5, metalness: 0.1 });
@@ -100,7 +100,7 @@ function buildWorld() {
   world = new THREE.Group();
   scene.add(world);
 
-  sim = makeSim({ seed });
+  sim = makeSim({ seed, pilot });
   gateMeshes = sim.course.gates.map((g) => {
     const m = makeGate(g);
     world.add(m);
@@ -108,13 +108,23 @@ function buildWorld() {
   });
   setGateMat(0, gateMatNext);
 
-  // faint racing line
-  const pts = [];
-  for (let i = 0; i <= 200; i++) pts.push(new THREE.Vector3(...sim.course.curve((i / 200) * Math.PI * 2)));
-  world.add(new THREE.Line(
-    new THREE.BufferGeometry().setFromPoints(pts),
-    new THREE.LineDashedMaterial({ color: '#7f93b0', dashSize: 1.2, gapSize: 1.6, transparent: true, opacity: 0.35 })
-  ).computeLineDistances());
+  // planned racing line, coloured by planned speed (blue = braking for a turn, orange = flat out)
+  const plan = sim.plan;
+  const linePos = new Float32Array(plan.pts.length * 3);
+  const lineCol = new Float32Array(plan.pts.length * 3);
+  const vLo = Math.min(...plan.pts.map((q) => q.v)), vHi = Math.max(...plan.pts.map((q) => q.v));
+  const slow = new THREE.Color('#3d8bff'), fast = new THREE.Color('#ff8a3d'), c = new THREE.Color();
+  plan.pts.forEach((q, i) => {
+    linePos.set(q.p, i * 3);
+    c.copy(slow).lerp(fast, (q.v - vLo) / Math.max(1e-6, vHi - vLo));
+    lineCol.set([c.r, c.g, c.b], i * 3);
+  });
+  const lineGeo = new THREE.BufferGeometry();
+  lineGeo.setAttribute('position', new THREE.BufferAttribute(linePos, 3));
+  lineGeo.setAttribute('color', new THREE.BufferAttribute(lineCol, 3));
+  racingLine = new THREE.LineLoop(lineGeo, new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.75 }));
+  racingLine.visible = pilot === 'racing';
+  world.add(racingLine);
 
   // scenery for parallax: scattered pillars away from the course
   const rand = mulberry(seed * 7919);
@@ -208,6 +218,7 @@ function updateHud(force) {
   $('s-best').textContent = fmt(s.laps.length ? Math.min(...s.laps) : null);
   $('s-speed').textContent = `${(v3.len(sim.drone.vel) * 3.6).toFixed(0)} km/h`;
   $('s-gates').textContent = s.gatesPassed;
+  $('s-plan').textContent = pilot === 'racing' ? fmt(sim.plan.lapTime) : '–';
   if (force) return;
   for (; lastEvents < sim.events.length; lastEvents++) {
     const e = sim.events[lastEvents];
@@ -242,9 +253,15 @@ $('b-speed').onclick = () => {
   $('b-speed').textContent = `Speed: ${timeScale}×`;
 };
 $('b-course').onclick = () => { seed++; buildWorld(); };
+$('b-pilot').onclick = () => {
+  pilot = pilot === 'racing' ? 'pursuit' : 'racing';
+  $('b-pilot').textContent = `Pilot: ${pilot === 'racing' ? 'racing line' : 'pursuit'}`;
+  buildWorld();
+};
 addEventListener('keydown', (e) => {
   if (e.key === 'c') $('b-cam').click();
   if (e.key === 'n') $('b-course').click();
+  if (e.key === 'p') $('b-pilot').click();
 });
 
 // ---------- main loop ----------
