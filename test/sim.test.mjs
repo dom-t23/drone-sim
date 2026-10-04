@@ -5,6 +5,7 @@ import {
   makeSim, step, planRacingLine, makeCourse, v3, GATE_INNER, DRONE, G, DIFFICULTIES,
   cameraPose, project, gateCorners, solveGatePose, CAMERA, optimiseLine, SHAPING, WIND,
 } from '../src/sim.js';
+import { makeSplits, splitsOnEvent } from '../src/splits.js';
 
 const SEEDS = [1, 2, 3, 4, 5, 7, 11, 42];
 
@@ -394,4 +395,30 @@ test('gusts stay within two sigma of the forecast, and calm runs carry no wind',
   }
   assert.equal(makeSim({ seed: 9 }).wind, null);
   assert.equal(makeSim({ seed: 9, wind: 'hurricane' }).wind, null);
+});
+
+// ---------- splits (2026-10-04) ----------
+
+test('gate splits compare each gate with the best lap so far', () => {
+  const S = makeSplits();
+  const feed = (gate, t) => splitsOnEvent(S, { type: 'gate', gate, t });
+  feed(0, 2); feed(1, 5); feed(2, 9); feed(0, 14); // lap 1: 12 s
+  assert.equal(S.bestLap, 12);
+  assert.deepEqual(S.rows.at(-1), { label: 'Lap', time: 12, delta: null });
+  feed(1, 16.5); // 2.5 s into lap 2 vs 3 s on the best lap
+  assert.ok(Math.abs(S.rows.at(-1).delta + 0.5) < 1e-9);
+  feed(2, 21.5); feed(0, 26.5); // lap 2: 12.5 s, slower
+  assert.ok(Math.abs(S.rows.at(-1).delta - 0.5) < 1e-9);
+  assert.equal(S.bestLap, 12, 'a slower lap does not replace the best');
+  splitsOnEvent(S, { type: 'miss', gate: 1, t: 30 });
+  assert.equal(S.rows.length, 5, 'only the last five rows are kept; misses are ignored');
+});
+
+test('splits from a real flight: one row per gate, deltas once a lap is done', () => {
+  const S = makeSplits(), sim = run(3, 40);
+  sim.events.forEach((e) => splitsOnEvent(S, e, 100));
+  const gates = sim.events.filter((e) => e.type === 'gate').length;
+  assert.equal(S.rows.length, gates - 1, 'every gate after the first start line gives a row');
+  assert.ok(Math.abs(S.bestLap - Math.min(...sim.state.laps)) < 1e-9);
+  assert.ok(S.rows.slice(10).every((r) => r.delta !== null));
 });

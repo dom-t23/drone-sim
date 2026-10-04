@@ -2,6 +2,11 @@
 
 Newest first. One entry per night's run.
 
+## 2026-10-04 (fifth run): Telemetry
+- **New Telemetry button (or `T`)** opens a live panel: strip charts of the last 10 seconds for **speed** (with the planned speed dashed on top), **tilt** and **thrust** (each against the airframe's limit), and **distance off the racing line**. Below them are F1-style **gate splits**: the time into the lap at each gate, with green or red deltas against your best lap. Try it in gusty wind to watch the drone work harder.
+- The charts follow a validated colour scheme for the dark panel (orange actual, blue plan, grey limits, each checked for colour-blind separation and contrast). Each chart has one axis with its range in the header and the live value beside it.
+- The split logic lives in its own module (`src/splits.js`) with tests: deltas against the best lap, a slower lap never replacing the best, and one row per gate in a real flight.
+
 ## 2026-10-04 (fourth run): Wind
 - **New Wind button (or `W`)**: off, **breezy** (6 m/s with 2.5 m/s gusts) or **gusty** (12 m/s with 6 m/s gusts), from a random direction per course and saved in the URL (`&wind=gusty`). Streaks drift past the drone so you can see it blowing, and a new **Wind** HUD row shows the real wind next to the drone's own estimate (e.g. `19 m/s · est 19`).
 - The drone measures the wind it's fighting with a **disturbance observer**: it compares the acceleration it actually gets with what its still-air model predicted, low-passes the difference, and cancels it in the next command. Over a flight its average wind estimate matches the real wind to within 0.5 m/s. In gusty wind it cuts the worst tracking errors by about a third; on hard courses, the worst error from the line drops from 1.9 m to 1.1 m.

@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { makeSim, step, GATE_INNER, v3, DIFFICULTIES, NAV_MODES, WIND_MODES, DRONE } from './sim.js';
+import { makeTelemetry, resetTelemetry, sampleTelemetry, drawTelemetry } from './telemetry.js';
 
 const DT = 1 / 120;
 const $ = (id) => document.getElementById(id);
@@ -52,6 +53,7 @@ const CAM_MODES = ['chase', 'orbit', 'fpv'];
 // ---------- world objects (rebuilt per course) ----------
 let sim, seed = 1, difficulty = 'normal', pilot = 'racing', nav = 'truth', world = new THREE.Group(), racingLine = null;
 let ghosts = [], lineVersion = -1, windMode = 'off';
+const telemetry = makeTelemetry($('telemetry'));
 scene.add(world);
 
 const gateMatIdle = new THREE.MeshStandardMaterial({ color: '#d9e2ef', roughness: 0.5, metalness: 0.1 });
@@ -135,6 +137,7 @@ function buildWorld() {
   });
   racingLine = null;
   drawRacingLine();
+  resetTelemetry(telemetry);
   showNavNote();
 
   // scenery for parallax: scattered pillars away from the course
@@ -360,6 +363,12 @@ $('b-nav').onclick = () => {
   syncButtons();
   buildWorld();
 };
+$('b-tm').onclick = () => {
+  const el = $('telemetry');
+  el.hidden = !el.hidden;
+  $('b-tm').classList.toggle('on', !el.hidden);
+  if (!el.hidden) drawTelemetry(telemetry, sim);
+};
 $('b-wind').onclick = () => {
   windMode = WIND_MODES[(WIND_MODES.indexOf(windMode) + 1) % WIND_MODES.length];
   syncButtons();
@@ -410,6 +419,7 @@ addEventListener('keydown', (e) => {
   if (e.key === 'd') $('b-diff').click();
   if (e.key === 'v') $('b-nav').click();
   if (e.key === 'w') $('b-wind').click();
+  if (e.key === 't') $('b-tm').click();
 });
 
 // ---------- onboard overlay: what the camera detected this frame ----------
@@ -511,6 +521,7 @@ function frame(now) {
   let steps = 0;
   while (acc >= DT && steps < 1200) {
     step(sim, DT);
+    sampleTelemetry(telemetry, sim);
     acc -= DT;
     if (++steps % 6 === 0) pushTrail(sim.drone.pos);
   }
@@ -521,6 +532,7 @@ function frame(now) {
   updateCameras(dtFrame);
   updateHud();
   if (sim.planVersion !== lineVersion) drawRacingLine();
+  if (!$('telemetry').hidden && frameNo % 2 === 0) drawTelemetry(telemetry, sim);
   ghosts.forEach((g, i) => g.position.set(...sim.belief.gates[i].pos));
 
   const W = innerWidth, H = innerHeight;

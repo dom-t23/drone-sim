@@ -25,7 +25,8 @@ A rough backlog, not a contract. Each night picks the item that will make the bi
 - [ ] **Manual flight**: keyboard, gamepad and touch controls to race against the autopilot ghost.
 
 ## Showing off
-- [ ] **Telemetry panel**: speed, thrust and tilt graphs, gate split times.
+- [x] **Telemetry panel**: speed (vs plan), tilt and thrust (vs limits), distance off the line, gate splits vs best lap (2026-10-04).
+  - **Next steps:** hover read-outs on the charts; a vision panel (estimate error per gate over time); export a lap's telemetry as CSV.
 - [ ] **Night mode** with LED-lit gates, prop wash particles and motor sound.
 - [ ] **Landing page polish**: intro overlay, "what Claude built last night" from the changelog, version and build date in the corner.
 - [ ] **Performance**: holds 60 fps on a mid-range phone.
