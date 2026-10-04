@@ -7,7 +7,8 @@ A rough backlog, not a contract. Each night picks the item that will make the bi
   - **Next steps:** a split-S (two stacked gates flown in opposite directions) and other set pieces need the course generator to stop being a single loop around the centre; tighter hairpins. The pursuit pilot misses the odd gate on hard; that's fine as a baseline, but it could slow down more for angled gates.
 - [x] **Faster autopilot.** Racing line (Hermite spline through gate centres plus an envelope-aware speed profile) tracked with feedforward + PD, shown on the course. 27.3 s → 17.6 s a lap (2026-10-03).
   - Friction-circle coupling of turn and along-track budgets done (2026-10-04): ~17.3 s on normal.
-  - **Next steps:** optimise the gate crossing points within each opening and the tangent lengths (e.g. a few rounds of coordinate descent on planned lap time) instead of always aiming at the centre; then try minimum-snap. Retighten the lap-time test after each gain.
+  - Gate crossing points and tangent lengths optimised by coordinate descent on planned lap time (2026-10-04): ~16.3 s on normal.
+  - **Next steps:** minimum-snap or time-optimal (e.g. CPC-style) trajectories instead of Hermite segments; let the planner trade crossing offset against tracking margin per gate; speed up the optimiser (incremental re-planning of the two segments a gate touches) so vision can re-shape continuously. Retighten the lap-time test after each gain.
 - [ ] **Wind and disturbances.** Gusts, sensor noise, motor lag variation; the autopilot must stay robust.
 - [ ] **Crashes.** Gate-frame and pillar collisions, with a tumble and respawn.
 

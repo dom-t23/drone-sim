@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   makeSim, step, planRacingLine, makeCourse, v3, GATE_INNER, DRONE, G, DIFFICULTIES,
-  cameraPose, project, gateCorners, solveGatePose, CAMERA,
+  cameraPose, project, gateCorners, solveGatePose, CAMERA, optimiseLine, SHAPING,
 } from '../src/sim.js';
 
 const SEEDS = [1, 2, 3, 4, 5, 7, 11, 42];
@@ -33,15 +33,16 @@ for (const pilot of ['racing', 'pursuit']) {
 test('racing line is clearly faster than axis pursuit, and the gain is locked in', () => {
   // 2026-10-03: racing line averages ~17.6 s a lap against ~27.3 s for pursuit.
   // 2026-10-04: friction-circle speed profile, ~17.2 s (slowest seed 17.7 s).
+  // 2026-10-04 (third run): shaped line (crossing points and tangents), ~16.3 s (slowest 16.7 s).
   for (const seed of SEEDS) {
     const racing = mean(run(seed, 80).state.laps.slice(1));
     const pursuit = mean(run(seed, 120, { pilot: 'pursuit' }).state.laps.slice(1));
-    assert.ok(racing < 17.9, `seed ${seed}: racing lap ${racing.toFixed(2)} s`);
+    assert.ok(racing < 17.1, `seed ${seed}: racing lap ${racing.toFixed(2)} s`);
     assert.ok(racing < pursuit * 0.75, `seed ${seed}: racing ${racing.toFixed(2)} s vs pursuit ${pursuit.toFixed(2)} s`);
   }
 });
 
-test('racing pilot threads gates near the centre and stays on its planned line', () => {
+test('racing pilot threads each gate where it planned to and stays on its line', () => {
   for (const seed of SEEDS) {
     let worstGate = 0, worstTrack = 0, target = 0;
     run(seed, 60, {
@@ -49,24 +50,27 @@ test('racing pilot threads gates near the centre and stays on its planned line',
         if (sim.t > 5) worstTrack = Math.max(worstTrack, v3.len(v3.sub(sim.plan.pts[sim.track.idx].p, sim.drone.pos)));
         if (sim.state.target !== target) {
           const g = sim.course.gates[target];
-          const off = v3.sub(sim.drone.pos, g.pos);
+          const off = v3.sub(sim.drone.pos, sim.plan.cross[target]); // from the planned crossing point
           worstGate = Math.max(worstGate, v3.len(v3.sub(off, v3.scale(g.normal, v3.dot(off, g.normal)))));
           target = sim.state.target;
         }
       },
     });
-    assert.ok(worstGate < GATE_INNER / 2 - 0.8, `seed ${seed}: passed ${worstGate.toFixed(2)} m off centre`);
+    assert.ok(worstGate < 0.75, `seed ${seed}: passed ${worstGate.toFixed(2)} m from the planned crossing`);
     assert.ok(worstTrack < 1.2, `seed ${seed}: strayed ${worstTrack.toFixed(2)} m from the racing line`);
   }
 });
 
-test('racing line passes through every gate centre and respects the airframe envelope', () => {
+test('racing line passes through every gate opening and respects the airframe envelope', () => {
   for (const seed of SEEDS) {
     const course = makeCourse({ seed });
-    const plan = planRacingLine(course);
+    const plan = makeSim({ seed }).plan;
     for (const g of course.gates) {
-      const d = Math.min(...plan.pts.map((q) => v3.len(v3.sub(q.p, g.pos))));
-      assert.ok(d < plan.ds, `seed ${seed}: line misses gate ${g.id} by ${d.toFixed(2)} m`);
+      const c = plan.cross[g.id], off = v3.sub(c, g.pos);
+      assert.ok(Math.abs(v3.dot(off, g.normal)) < 1e-9, 'crossing point lies in the gate plane');
+      assert.ok(Math.max(Math.abs(v3.dot(off, g.right)), Math.abs(v3.dot(off, g.up))) <= SHAPING.maxOffset + 1e-9);
+      const d = Math.min(...plan.pts.map((q) => v3.len(v3.sub(q.p, c))));
+      assert.ok(d < plan.ds, `seed ${seed}: line misses its crossing at gate ${g.id} by ${d.toFixed(2)} m`);
     }
     for (const q of plan.pts) {
       assert.ok(Number.isFinite(q.v) && q.v > 0 && q.v <= plan.params.vMax);
@@ -155,7 +159,7 @@ for (const difficulty of ['easy', 'hard']) {
       });
       assert.ok(sim.state.laps.length >= 2, `seed ${seed}: only ${sim.state.laps.length} laps`);
       assert.equal(sim.state.misses, 0, `seed ${seed}: ${sim.state.misses} missed gates`);
-      assert.ok(worstGate < GATE_INNER / 2 - 0.4, `seed ${seed}: passed ${worstGate.toFixed(2)} m off centre`);
+      assert.ok(worstGate < GATE_INNER / 2 - 0.35, `seed ${seed}: passed ${worstGate.toFixed(2)} m off centre`);
       assert.ok(worstTrack < 1.0, `seed ${seed}: strayed ${worstTrack.toFixed(2)} m from the racing line`);
     }
   });
@@ -165,7 +169,7 @@ test('lap times rise with difficulty', () => {
   const lap = (d) => mean(SEEDS.map((seed) => run(seed, 70, { difficulty: d }).state.laps.slice(1)).map(mean));
   const [easy, normal, hard] = DIFFICULTIES.map(lap);
   assert.ok(easy < normal && normal < hard, `easy ${easy.toFixed(2)}, normal ${normal.toFixed(2)}, hard ${hard.toFixed(2)}`);
-  assert.ok(hard < 22.5, `hard laps averaged ${hard.toFixed(2)} s`);
+  assert.ok(hard < 21, `hard laps averaged ${hard.toFixed(2)} s`);
 });
 
 test('planned line stays clear of the ground and its speed changes fit the envelope with the turns', () => {
@@ -273,7 +277,7 @@ for (const difficulty of DIFFICULTIES) {
       const { sim, worstGate, estErr } = visionFlight(seed, difficulty);
       assert.equal(sim.state.misses, 0, `seed ${seed}: ${sim.state.misses} missed gates`);
       assert.ok(sim.state.laps.length >= 2, `seed ${seed}: only ${sim.state.laps.length} laps`);
-      assert.ok(worstGate < GATE_INNER / 2 - 0.4, `seed ${seed}: passed ${worstGate.toFixed(2)} m off centre`);
+      assert.ok(worstGate < GATE_INNER / 2 - 0.35, `seed ${seed}: passed ${worstGate.toFixed(2)} m off centre`);
       assert.ok(Math.max(...estErr) < 0.5, `seed ${seed}: a gate was passed with its estimate ${Math.max(...estErr).toFixed(2)} m out`);
       assert.ok(mean(estErr) < 0.06, `seed ${seed}: estimates averaged ${mean(estErr).toFixed(3)} m out at the gate`);
       assert.ok(sim.vision.stats.replans > 0);
@@ -293,11 +297,33 @@ test('vision throws out wild detections and keeps the clean ones', () => {
   assert.ok(cleanRejected / clean < 0.03, `${cleanRejected} of ${clean} clean detections rejected`);
 });
 
-test('vision costs almost no lap time against perfect knowledge', () => {
-  for (const seed of SEEDS) {
-    const vision = mean(visionFlight(seed, 'normal').sim.state.laps.slice(1));
-    const truth = mean(run(seed, 50).state.laps.slice(1));
-    assert.ok(vision < truth * 1.03, `seed ${seed}: vision ${vision.toFixed(2)} s vs truth ${truth.toFixed(2)} s`);
+test('vision costs almost no lap time once it has seen the course', () => {
+  // after lap 1 vision re-shapes the line for the gates it has found
+  const ratios = SEEDS.map((seed) => {
+    const vision = mean(run(seed, 70, { nav: 'vision' }).state.laps.slice(2));
+    const truth = mean(run(seed, 70).state.laps.slice(2));
+    assert.ok(vision < truth * 1.05, `seed ${seed}: vision ${vision.toFixed(2)} s vs truth ${truth.toFixed(2)} s`);
+    return vision / truth;
+  });
+  assert.ok(mean(ratios) < 1.025, `vision laps average ${((mean(ratios) - 1) * 100).toFixed(1)}% slower`);
+});
+
+test('line shaping: faster plans, crossings inside their limits, start gate centred', () => {
+  for (const difficulty of DIFFICULTIES) {
+    const gains = SEEDS.map((seed) => {
+      const course = makeCourse({ seed, difficulty });
+      const shape = optimiseLine(course);
+      assert.deepEqual(shape[0], { dr: 0, du: 0, k: 1 });
+      for (const sh of shape) {
+        assert.ok(Math.abs(sh.dr) <= SHAPING.maxOffset && Math.abs(sh.du) <= SHAPING.maxOffset);
+        assert.ok(sh.k >= SHAPING.k[0] && sh.k <= SHAPING.k[1]);
+      }
+      const shaped = planRacingLine(course, { shape }), plain = planRacingLine(course);
+      assert.ok(shaped.minY >= SHAPING.minY - 0.2, `${difficulty} seed ${seed}: shaped line dips to ${shaped.minY.toFixed(2)} m`);
+      return 1 - shaped.lapTime / plain.lapTime;
+    });
+    assert.ok(Math.min(...gains) >= 0, `${difficulty}: shaping made a plan slower`);
+    assert.ok(mean(gains) > (difficulty === 'normal' ? 0.045 : 0.025), `${difficulty}: shaping gained only ${(mean(gains) * 100).toFixed(1)}%`);
   }
 });
 

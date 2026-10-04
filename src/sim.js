@@ -215,13 +215,20 @@ export function planRacingLine(course, opts = {}) {
   const n = gates.length;
   const pts = []; // {p, s, gate} — gate is set on the sample at each gate centre
   // dense parameter sampling per segment, then resample to even arc length
+  // optional shape per gate: where the line crosses the opening (dr right, du up, m from
+  // the centre) and how long its tangent is there (k, a multiple of tangentScale)
+  const shape = P.shape;
+  const cross = gates.map((g, i) => {
+    const sh = shape?.[i];
+    return sh ? v3.add(g.pos, v3.add(v3.scale(g.right, sh.dr), v3.scale(g.up, sh.du))) : g.pos;
+  });
   const raw = [];
   for (let i = 0; i < n; i++) {
-    const a = gates[i], b = gates[(i + 1) % n];
-    const L = v3.len(v3.sub(b.pos, a.pos)) * P.tangentScale;
-    const m0 = v3.scale(a.normal, L), m1 = v3.scale(b.normal, L);
-    const steps = 400;
-    for (let k = 0; k < steps; k++) raw.push({ p: hermite(a.pos, m0, b.pos, m1, k / steps), gate: k === 0 ? i : -1 });
+    const a = gates[i], b = gates[(i + 1) % n], pa = cross[i], pb = cross[(i + 1) % n];
+    const L = v3.len(v3.sub(pb, pa)) * P.tangentScale;
+    const m0 = v3.scale(a.normal, L * (shape?.[i]?.k ?? 1)), m1 = v3.scale(b.normal, L * (shape?.[(i + 1) % n]?.k ?? 1));
+    const steps = P.steps ?? 400;
+    for (let k = 0; k < steps; k++) raw.push({ p: hermite(pa, m0, pb, m1, k / steps), gate: k === 0 ? i : -1 });
   }
   // cumulative length of the raw polyline
   const rawS = [0];
@@ -269,7 +276,50 @@ export function planRacingLine(course, opts = {}) {
     pts[k].at = (v[k] * (vn - vp)) / (2 * ds);
   }
   const lapTime = v.reduce((sum, x) => sum + ds / x, 0);
-  return { pts, ds, length: total, gateS, lapTime, params: P };
+  const minY = Math.min(...pts.map((q) => q.p[1]));
+  return { pts, ds, length: total, gateS, lapTime, minY, cross, params: P };
+}
+
+// Shape the line for speed: for each gate, where it crosses the opening (up to maxOffset
+// from the centre, leaving room for tracking error) and how hard it swings in (tangent
+// length; the start gate keeps the centre). Coordinate descent on the planned lap time, using quick coarse plans, with
+// shrinking steps; candidates that bring the line within 1.8 m of the ground are refused.
+export const SHAPING = { maxOffset: 0.6, rounds: 3, k: [0.6, 1.8], minY: 1.8, coarse: { steps: 80, ds: 0.6 } };
+const shapeCache = new Map();
+// start/rounds/stepScale allow a quick warm-started refinement of an existing shape.
+export function optimiseLine(course, key, { start = null, rounds = SHAPING.rounds, stepScale = 1 } = {}) {
+  if (key && shapeCache.has(key)) return shapeCache.get(key).map((sh) => ({ ...sh }));
+  const n = course.gates.length, S = SHAPING;
+  const shape = course.gates.map((_, i) => ({ dr: 0, du: 0, k: 1, ...start?.[i] }));
+  const cost = () => {
+    const p = planRacingLine(course, { ...S.coarse, shape });
+    return p.minY < S.minY ? Infinity : p.lapTime;
+  };
+  const step = { dr: 0.3 * stepScale, du: 0.3 * stepScale, k: 0.2 * stepScale };
+  const lim = { dr: [-S.maxOffset, S.maxOffset], du: [-S.maxOffset, S.maxOffset], k: S.k };
+  let best = cost();
+  for (let r = 0; r < rounds; r++) {
+    // the start gate is crossed mid-launch, so it keeps the centre line
+    for (let i = 1; i < n; i++) {
+      for (const key of ['dr', 'du', 'k']) {
+        for (const sign of [1, -1]) {
+          const old = shape[i][key];
+          const v = Math.max(lim[key][0], Math.min(lim[key][1], old + sign * step[key]));
+          if (v === old) continue;
+          shape[i][key] = v;
+          const c = cost();
+          if (c < best) { best = c; break; }
+          shape[i][key] = old;
+        }
+      }
+    }
+    for (const key in step) step[key] *= 0.6;
+  }
+  if (key) {
+    if (shapeCache.size > 64) shapeCache.delete(shapeCache.keys().next().value);
+    shapeCache.set(key, shape.map((sh) => ({ ...sh })));
+  }
+  return shape;
 }
 
 // The envelope checks below are plain scalar code: the planner runs them a few hundred
@@ -690,6 +740,12 @@ function visionFrame(sim) {
   }
   V.frame = { t: sim.t, dets };
   V.stats.frames++;
+  // after the first lap every gate has been seen: re-shape the line for the real course
+  if (sim.shape && !V.reshaped && sim.state.laps.length >= 1) {
+    sim.shape = optimiseLine(sim.belief, null, { start: sim.shape, rounds: 2, stepScale: 0.5 });
+    V.reshaped = true;
+    replan(sim);
+  }
   // re-plan once the estimates have moved enough from the ones the plan was built on
   if (sim.pilot !== 'pursuit' && sim.t - V.lastPlan >= VISION.replanEvery) {
     const shift = Math.max(...sim.belief.gates.map((b, i) => v3.len(v3.sub(b.pos, V.planned[i]))));
@@ -699,7 +755,7 @@ function visionFrame(sim) {
 
 function replan(sim) {
   const V = sim.vision, s = sim.plan.pts[sim.track.idx].s;
-  const plan = planRacingLine(sim.belief);
+  const plan = planRacingLine(sim.belief, { shape: sim.shape });
   sim.plan = plan;
   sim.track.idx = nearestIndex(plan, sim.drone.pos, Math.round(s / plan.ds) % plan.pts.length, 60, 60);
   sim.planVersion++;
@@ -713,12 +769,14 @@ export const PILOTS = ['racing', 'pursuit'];
 
 // nav: 'truth' flies from the true gate positions; 'vision' starts from a map with every
 // gate moved and corrects it with the camera; 'blind' trusts the map and nothing else.
-export function makeSim({ seed = 1, gates, pilot = 'racing', difficulty = 'normal', nav = 'truth' } = {}) {
+export function makeSim({ seed = 1, gates, pilot = 'racing', difficulty = 'normal', nav = 'truth', optimise = true } = {}) {
   const course = makeCourse({ seed, gates, difficulty });
   if (!NAV_MODES.includes(nav)) nav = 'truth';
   const belief = nav === 'truth' ? null : makeMap(course, seed);
   const drone = makeDrone(course);
-  const plan = planRacingLine(belief ?? course);
+  // the racing pilot flies an optimised line; vision keeps its shape through re-plans
+  const shape = pilot === 'racing' && optimise ? optimiseLine(belief ?? course, `${difficulty}/${seed}/${gates}/${nav !== 'truth'}`) : null;
+  const plan = planRacingLine(belief ?? course, { shape });
   if (course.difficulty !== 'normal') {
     // take off from the ground under the racing line, 18 m before the start gate, so the
     // first gate is a straight climb along the line even when the course curves into it
@@ -742,6 +800,7 @@ export function makeSim({ seed = 1, gates, pilot = 'racing', difficulty = 'norma
       stats: { frames: 0, accepted: 0, rejected: 0, lost: 0, wild: 0, wildRejected: 0, replans: 0 },
     } : null,
     plan,
+    shape,
     planVersion: 0,
     launchAt: nav === 'vision' ? VISION.lookFirst : 0, // vision takes a look before it goes
     track: { idx: nearestIndex(plan, drone.pos, 0, 0, plan.pts.length) },

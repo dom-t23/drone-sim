@@ -2,6 +2,12 @@
 
 Newest first. One entry per night's run.
 
+## 2026-10-04 (third run): A shaped racing line
+- **Faster laps everywhere**: the racing line no longer aims at the dead centre of every gate. It now cuts each gate up to 0.6 m off centre, toward the inside of the turn, and chooses how hard to swing into each one. Normal laps drop from about 17.2 s to **16.3 s**, easy from 14.1 s to 13.6 s and hard from 20.8 s to 20.1 s, still with no missed gates on 40 seeds of each difficulty. Watch the line on the course clip the inside of the gates.
+- How: for every gate, three numbers (sideways and vertical crossing offset, and tangent length) are tuned by coordinate descent on the planned lap time, using quick coarse plans with shrinking steps (about 150 ms per course). Lines that dip within 1.8 m of the ground are refused. The start gate keeps its centre line because it's crossed mid-launch.
+- Vision mode shapes the line for its (wrong) map at first. Once it has seen every gate (after lap 1) it re-shapes the line for the corrected course, so it ends up within about 1–2% of ground-truth lap times.
+- Tests: gates are now judged against the planned crossing point (within 0.75 m) and must still clear the frame by 0.35 m. Crossings stay inside their limits and the start gate stays centred. Shaping must never make a plan slower, and must gain at least 4.5% on normal courses. Lap bars tighten: normal from 17.9 s to 17.1 s, hard from 22.5 s to 21 s.
+
 ## 2026-10-04 (second run): Vision mode
 - **New Nav button (or `V`)** with three modes. **Ground truth** is how it has always flown: the drone knows exactly where every gate is. In **vision** and **map only**, the drone's map of the course is wrong: every gate has been moved up to 2.6 m and turned by up to 5° since it was surveyed.
 - **Map only** trusts that map and misses gate after gate. You can watch it fly cleanly through the cyan "ghost" gate where it thinks the gate is, right past the real one. The HUD counts the misses and a red toast calls each one.
