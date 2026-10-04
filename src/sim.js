@@ -198,14 +198,15 @@ export const RACING = {
   launchRate: 9, // m/s per second the speed cap rises at from a standstill
 };
 
-// Cubic Hermite point and derivatives on [0, 1].
+// Cubic Hermite point on [0, 1].
 function hermite(p0, m0, p1, m1, u) {
   const u2 = u * u, u3 = u2 * u;
-  const h00 = 2 * u3 - 3 * u2 + 1, h10 = u3 - 2 * u2 + u, h01 = -2 * u3 + 3 * u2, h11 = u3 - u2;
-  const d00 = 6 * u2 - 6 * u, d10 = 3 * u2 - 4 * u + 1, d01 = -6 * u2 + 6 * u, d11 = 3 * u2 - 2 * u;
-  const e00 = 12 * u - 6, e10 = 6 * u - 4, e01 = -12 * u + 6, e11 = 6 * u - 2;
-  const mix = (a, b, c, d) => [0, 1, 2].map((k) => a * p0[k] + b * m0[k] + c * p1[k] + d * m1[k]);
-  return { p: mix(h00, h10, h01, h11), d1: mix(d00, d10, d01, d11), d2: mix(e00, e10, e01, e11) };
+  const a = 2 * u3 - 3 * u2 + 1, b = u3 - 2 * u2 + u, c = -2 * u3 + 3 * u2, d = u3 - u2;
+  return [
+    a * p0[0] + b * m0[0] + c * p1[0] + d * m1[0],
+    a * p0[1] + b * m0[1] + c * p1[1] + d * m1[1],
+    a * p0[2] + b * m0[2] + c * p1[2] + d * m1[2],
+  ];
 }
 
 export function planRacingLine(course, opts = {}) {
@@ -220,7 +221,7 @@ export function planRacingLine(course, opts = {}) {
     const L = v3.len(v3.sub(b.pos, a.pos)) * P.tangentScale;
     const m0 = v3.scale(a.normal, L), m1 = v3.scale(b.normal, L);
     const steps = 400;
-    for (let k = 0; k < steps; k++) raw.push({ p: hermite(a.pos, m0, b.pos, m1, k / steps).p, gate: k === 0 ? i : -1 });
+    for (let k = 0; k < steps; k++) raw.push({ p: hermite(a.pos, m0, b.pos, m1, k / steps), gate: k === 0 ? i : -1 });
   }
   // cumulative length of the raw polyline
   const rawS = [0];
@@ -247,16 +248,17 @@ export function planRacingLine(course, opts = {}) {
   // speed profile: turn limit, then forward (accel) and backward (brake) passes, twice round the loop
   // Along-track acceleration and braking share the envelope with the turn (a
   // friction-circle style limit), so a crest or tight corner leaves less for braking.
-  const v = pts.map((q) => turnSpeedLimit(q.kv, P));
+  const E = envelope(P);
+  const v = pts.map((q) => turnSpeedLimit(q.kv, P, E));
   for (let pass = 0; pass < 2; pass++) {
     for (let k = 1; k <= N; k++) {
       const i = k % N, h = k - 1;
-      const acc = alongLimit(pts[h], v[h], P.aAccel, 1, P);
+      const acc = alongLimit(pts[h], v[h], P.aAccel, 1, E);
       v[i] = Math.min(v[i], Math.sqrt(v[h] * v[h] + 2 * acc * ds));
     }
     for (let k = N - 1; k >= 0; k--) {
       const i = k, nx = (k + 1) % N;
-      const brk = alongLimit(pts[i], v[nx], P.aBrake, -1, P);
+      const brk = alongLimit(pts[i], v[nx], P.aBrake, -1, E);
       v[i] = Math.min(v[i], Math.sqrt(v[nx] * v[nx] + 2 * brk * ds));
     }
   }
@@ -270,45 +272,56 @@ export function planRacingLine(course, opts = {}) {
   return { pts, ds, length: total, gateS, lapTime, params: P };
 }
 
+// The envelope checks below are plain scalar code: the planner runs them a few hundred
+// thousand times per plan, and vision mode re-plans in flight.
+function envelope(P) {
+  return {
+    tanTilt: Math.tan(DRONE.maxTiltRad),
+    tanCombo: Math.tan(DRONE.maxTiltRad * P.comboMargin),
+    maxTurn: DRONE.maxThrustAcc * P.turnMargin,
+    maxCombo: DRONE.maxThrustAcc * P.comboMargin,
+    turnMargin: P.turnMargin,
+  };
+}
+
 // Fastest speed at which the turn at curvature vector kv fits inside the airframe's
 // envelope (tilt limit and max thrust), scaled by a safety margin. Diving turns are
 // limited hardest because less vertical thrust means less sideways force at max tilt.
-function turnFeasible(kv, v, P) {
-  const a = v3.scale(kv, v * v);
-  const ty = (a[1] + G) * P.turnMargin; // vertical thrust available
-  const th = Math.hypot(a[0], a[2]);
-  if (ty <= 0) return th < 1e-6 && a[1] + G >= 0;
-  return th <= ty * Math.tan(DRONE.maxTiltRad) && Math.hypot(th, a[1] + G) <= DRONE.maxThrustAcc * P.turnMargin;
+function turnFeasible(kv, v, E) {
+  const v2 = v * v, ax = kv[0] * v2, az = kv[2] * v2, lift = kv[1] * v2 + G;
+  const ty = lift * E.turnMargin; // vertical thrust available
+  const th = Math.sqrt(ax * ax + az * az);
+  if (ty <= 0) return th < 1e-6 && lift >= 0;
+  return th <= ty * E.tanTilt && Math.sqrt(th * th + lift * lift) <= E.maxTurn;
 }
 // Largest along-track acceleration (dir 1) or braking (dir -1), up to budget, that
 // fits the envelope together with the turn at speed v. Coasting (drag alone, no thrust
 // along the path) is the cheapest way to slow down, so braking searches upwards from it.
-function alongLimit(q, v, budget, dir, P) {
+function alongLimit(q, v, budget, dir, E) {
+  const v2 = v * v, kx = q.kv[0] * v2, ky = q.kv[1] * v2 + G, kz = q.kv[2] * v2;
+  const tx = q.t[0], ty = q.t[1], tz = q.t[2], drag = DRONE.drag * v;
   const fits = (x) => {
-    const at = dir * x + DRONE.drag * v; // thrust along the path: the speed change plus beating drag
-    return thrustFits(v3.add(v3.scale(q.kv, v * v), v3.scale(q.t, at)), P.comboMargin);
+    const at = dir * x + drag; // thrust along the path: the speed change plus beating drag
+    const ax = kx + tx * at, ay = ky + ty * at, az = kz + tz * at; // gravity included in ay
+    if (ay <= 0) return false;
+    const th = Math.sqrt(ax * ax + az * az);
+    return th <= ay * E.tanCombo && Math.sqrt(th * th + ay * ay) <= E.maxCombo;
   };
-  let lo = dir > 0 ? 0 : Math.min(budget, DRONE.drag * v), hi = budget;
+  let lo = dir > 0 ? 0 : Math.min(budget, drag), hi = budget;
   if (fits(hi)) return hi;
-  if (!fits(lo)) return dir > 0 ? -DRONE.drag * v : lo; // can't even hold speed: coast
+  if (!fits(lo)) return dir > 0 ? -drag : lo; // can't even hold speed: coast
   for (let i = 0; i < 16; i++) {
     const mid = (lo + hi) / 2;
     if (fits(mid)) lo = mid; else hi = mid;
   }
   return lo;
 }
-// Does path acceleration a (excluding gravity) fit inside a fraction of the envelope?
-function thrustFits(a, margin) {
-  const ty = a[1] + G, th = Math.hypot(a[0], a[2]);
-  if (ty <= 0) return false;
-  return th <= ty * Math.tan(DRONE.maxTiltRad * margin) && Math.hypot(th, ty) <= DRONE.maxThrustAcc * margin;
-}
-function turnSpeedLimit(kv, P) {
-  if (turnFeasible(kv, P.vMax, P)) return P.vMax;
+function turnSpeedLimit(kv, P, E) {
+  if (turnFeasible(kv, P.vMax, E)) return P.vMax;
   let lo = 0, hi = P.vMax;
   for (let i = 0; i < 24; i++) {
     const mid = (lo + hi) / 2;
-    if (turnFeasible(kv, mid, P)) lo = mid; else hi = mid;
+    if (turnFeasible(kv, mid, E)) lo = mid; else hi = mid;
   }
   return lo;
 }
@@ -339,7 +352,7 @@ export function racingPilot(sim) {
   const ahead = Math.round((speed * DRONE.thrustLag) / plan.ds);
   const q = plan.pts[track.idx];
   const qa = plan.pts[(track.idx + ahead) % N];
-  const cap = 3 + P.launchRate * sim.t; // gentle launch from a standstill
+  const cap = 3 + P.launchRate * (sim.t - sim.launchAt); // gentle launch from a standstill
   const vRef = Math.min(qa.v, cap);
   const atRef = vRef < qa.v ? Math.min(P.aAccel, P.launchRate) : qa.at;
   const velRef = v3.scale(qa.t, vRef);
@@ -350,13 +363,362 @@ export function racingPilot(sim) {
   return v3.add(a, [0, G, 0]);
 }
 
+// ---------- vision ----------
+// Vision mode, step 1. The drone no longer knows exactly where the gates are: it has a
+// survey map whose gates have since been knocked out of place. A synthetic onboard camera
+// (the same one the onboard view renders) finds the inner corners of each gate in view,
+// with pixel noise, lost corners and the odd wildly wrong corner. Each detection becomes a
+// gate pose by PnP (Gauss-Newton on the reprojection error), is checked against what the
+// drone already believes (innovation gating) and is fused into a per-gate estimate. When
+// the estimates move, the racing line is re-planned through them in flight. The drone's
+// own position and attitude are still taken as known: estimating those is step 2.
+
+export const NAV_MODES = ['truth', 'vision', 'blind'];
+
+export const CAMERA = {
+  vfov: 85 * DEG, // vertical field of view, same as the rendered onboard camera
+  aspect: 16 / 9,
+  heightPx: 480, // image height the pixel figures below refer to
+  tilt: 18 * DEG, // tilted up from the body's forward axis, like a real FPV camera
+  mount: [0, 0.132, 0.44], // camera position in the body frame, m (matches the 3D model)
+  rate: 30, // frames per second
+  noisePx: 1.0, // corner noise, pixels, 1 sigma
+  dropout: 0.06, // chance any one corner is lost (stands in for occlusion and blur)
+  outlierRate: 0.03, // chance a detection has one corner badly wrong
+  outlierPx: 30, // how wrong, pixels
+  maxRange: 50, // m; further away a gate is too small to find
+  minFacing: 0.25, // gates seen more edge-on than this are skipped
+};
+
+export const MAP_ERROR = {
+  shift: [1.0, 2.6], // m: every gate has moved this far within its own plane...
+  vertical: 0.6, // ...with vertical moves scaled down...
+  along: 1.0, // ...up to this far forwards or backwards (m)...
+  yaw: 5 * DEG, // ...and turned by up to this much
+  sigma: 2.0, // m: how far the drone trusts the map (1 sigma)
+};
+
+const VISION = {
+  rotSigma: 0.15, // rad: weak prior keeping each PnP fit near the mapped orientation
+  chi2Fit: 40, // reprojection misfit above which a detection is thrown out
+  chi2Gate: 16.3, // innovation gate (chi-square, 3 dof, 99.9%)
+  inflate: 2, // measurement covariance inflation, for model mismatch
+  resetAfter: 12, // consecutive rejections before a gate's estimate is restarted
+  replanShift: 0.1, // m: re-plan once any gate estimate has moved this far...
+  replanEvery: 0.25, // s: ...but no more often than this
+  lookFirst: 0.5, // s on the pad watching the first gate before launch
+};
+
+// Pose of the onboard camera: forward, up and image-right axes plus position, built the
+// same way the renderer orients the drone (yaw, then tilt the body up axis onto the thrust).
+export function cameraPose(drone) {
+  const t = v3.norm(drone.thrust), c = t[1];
+  const tilt = (v) => {
+    // rotate v by the minimal rotation taking world up onto t (axis up x t)
+    const k = [t[2], 0, -t[0]], kv = k[0] * v[0] + k[2] * v[2];
+    const kx = [k[1] * v[2] - k[2] * v[1], k[2] * v[0] - k[0] * v[2], k[0] * v[1] - k[1] * v[0]];
+    const f = kv / (1 + c);
+    return [v[0] * c + kx[0] + k[0] * f, v[1] * c + kx[1] + k[1] * f, v[2] * c + kx[2] + k[2] * f];
+  };
+  const cy = Math.cos(drone.yaw), sy = Math.sin(drone.yaw);
+  const bx = tilt([cy, 0, -sy]), by = t, bz = tilt([sy, 0, cy]);
+  const ca = Math.cos(CAMERA.tilt), sa = Math.sin(CAMERA.tilt), m = CAMERA.mount;
+  const mix = (a, wa, b, wb) => [a[0] * wa + b[0] * wb, a[1] * wa + b[1] * wb, a[2] * wa + b[2] * wb];
+  return {
+    pos: v3.add(drone.pos, v3.add(v3.scale(bx, m[0]), mix(by, m[1], bz, m[2]))),
+    fwd: mix(by, sa, bz, ca),
+    up: mix(by, ca, bz, -sa),
+    right: v3.scale(bx, -1), // the camera looks out of the nose, so image right is body -x
+  };
+}
+
+// Image-plane coordinates (x/z, y/z) of a world point, or null if it is behind the camera.
+export function project(cam, p) {
+  const dx = p[0] - cam.pos[0], dy = p[1] - cam.pos[1], dz = p[2] - cam.pos[2];
+  const z = dx * cam.fwd[0] + dy * cam.fwd[1] + dz * cam.fwd[2];
+  if (z < 0.2) return null;
+  return [
+    (dx * cam.right[0] + dy * cam.right[1] + dz * cam.right[2]) / z,
+    (dx * cam.up[0] + dy * cam.up[1] + dz * cam.up[2]) / z,
+  ];
+}
+
+// Corners of a gate's inner opening, in order round the frame.
+const CORNERS = [[-1, 1], [1, 1], [1, -1], [-1, -1]];
+export function gateCorners(g, pos = g.pos, right = g.right, up = g.up) {
+  const h = GATE_INNER / 2;
+  return CORNERS.map(([a, b]) => [
+    pos[0] + (right[0] * a + up[0] * b) * h,
+    pos[1] + (right[1] * a + up[1] * b) * h,
+    pos[2] + (right[2] * a + up[2] * b) * h,
+  ]);
+}
+
+// Rotate v by the rotation vector w (Rodrigues).
+function rotVec(v, w) {
+  const th = Math.hypot(w[0], w[1], w[2]);
+  if (th < 1e-12) return v;
+  const k = [w[0] / th, w[1] / th, w[2] / th], c = Math.cos(th), s = Math.sin(th);
+  const kv = (k[0] * v[0] + k[1] * v[1] + k[2] * v[2]) * (1 - c);
+  return [
+    v[0] * c + (k[1] * v[2] - k[2] * v[1]) * s + k[0] * kv,
+    v[1] * c + (k[2] * v[0] - k[0] * v[2]) * s + k[1] * kv,
+    v[2] * c + (k[0] * v[1] - k[1] * v[0]) * s + k[2] * kv,
+  ];
+}
+
+// Gate pose from its four detected corners (uv, image-plane units) by PnP: Levenberg-
+// Marquardt on the reprojection error in units of the pixel noise (sigma), starting
+// from the current belief. The unknowns are the gate centre and a small rotation away
+// from the mapped orientation; a weak prior on that rotation keeps far-off gates, whose
+// orientation the camera can barely see, well posed. Returns the centre, its 3x3
+// covariance and the final misfit (chi-square), or null if the fit fails.
+export function solveGatePose(cam, uv, start, sigma) {
+  const residuals = (x) => {
+    const w = [x[3], x[4], x[5]];
+    const corners = gateCorners(start, [x[0], x[1], x[2]], rotVec(start.right, w), rotVec(start.up, w));
+    const r = new Array(11);
+    for (let j = 0; j < 4; j++) {
+      const q = project(cam, corners[j]);
+      if (!q) return null;
+      r[2 * j] = (q[0] - uv[j][0]) / sigma;
+      r[2 * j + 1] = (q[1] - uv[j][1]) / sigma;
+    }
+    r[8] = x[3] / VISION.rotSigma; r[9] = x[4] / VISION.rotSigma; r[10] = x[5] / VISION.rotSigma;
+    return r;
+  };
+  const sumsq = (r) => r.reduce((a, b) => a + b * b, 0);
+  const normal = (x, r) => {
+    // Jacobian by forward differences, then the normal equations H = J'J, g = J'r
+    const J = [];
+    for (let p = 0; p < 6; p++) {
+      const e = p < 3 ? 1e-4 : 1e-5, xp = x.slice();
+      xp[p] += e;
+      const rp = residuals(xp);
+      if (!rp) return null;
+      J.push(rp.map((v, i) => (v - r[i]) / e));
+    }
+    const H = new Array(36), g = new Array(6);
+    for (let a = 0; a < 6; a++) {
+      g[a] = J[a].reduce((sum, v, i) => sum + v * r[i], 0);
+      for (let b = a; b < 6; b++) H[a * 6 + b] = H[b * 6 + a] = J[a].reduce((sum, v, i) => sum + v * J[b][i], 0);
+    }
+    return { H, g };
+  };
+  let x = [start.pos[0], start.pos[1], start.pos[2], 0, 0, 0];
+  let r = residuals(x);
+  if (!r) return null;
+  let cost = sumsq(r), lambda = 1e-3;
+  for (let it = 0; it < 15; it++) {
+    const ne = normal(x, r);
+    if (!ne) return null;
+    const A = ne.H.slice();
+    for (let a = 0; a < 6; a++) A[a * 7] *= 1 + lambda;
+    const step = cholSolve(A, 6, ne.g.map((v) => -v));
+    if (!step) { lambda *= 10; continue; }
+    const xn = x.map((v, i) => v + step[i]), rn = residuals(xn);
+    const cn = rn ? sumsq(rn) : Infinity;
+    if (cn < cost) {
+      const done = cost - cn < 1e-6 * cost + 1e-9 || Math.hypot(...step) < 1e-6;
+      x = xn; r = rn; cost = cn; lambda = Math.max(lambda / 3, 1e-9);
+      if (done) break;
+    } else if ((lambda *= 4) > 1e8) break;
+  }
+  const ne = normal(x, r);
+  if (!ne) return null;
+  const cov = [];
+  for (let a = 0; a < 3; a++) {
+    const col = cholSolve(ne.H.slice(), 6, [0, 1, 2, 3, 4, 5].map((i) => (i === a ? 1 : 0)));
+    if (!col) return null;
+    cov.push(col[0], col[1], col[2]);
+  }
+  // cov was filled column by column; the block is symmetric, so rows = columns
+  return { pos: [x[0], x[1], x[2]], cov, chi2: cost };
+}
+
+// Solve A x = b for a symmetric positive-definite n x n A (flat, row-major) by Cholesky.
+function cholSolve(A, n, b) {
+  const L = new Array(n * n).fill(0);
+  for (let i = 0; i < n; i++) {
+    for (let j = 0; j <= i; j++) {
+      let sum = A[i * n + j];
+      for (let k = 0; k < j; k++) sum -= L[i * n + k] * L[j * n + k];
+      if (i === j) {
+        if (!(sum > 1e-300)) return null;
+        L[i * n + i] = Math.sqrt(sum);
+      } else L[i * n + j] = sum / L[j * n + j];
+    }
+  }
+  const y = new Array(n);
+  for (let i = 0; i < n; i++) {
+    let sum = b[i];
+    for (let k = 0; k < i; k++) sum -= L[i * n + k] * y[k];
+    y[i] = sum / L[i * n + i];
+  }
+  const x = new Array(n);
+  for (let i = n - 1; i >= 0; i--) {
+    let sum = y[i];
+    for (let k = i + 1; k < n; k++) sum -= L[k * n + i] * x[k];
+    x[i] = sum / L[i * n + i];
+  }
+  return x;
+}
+
+// 3x3 helpers (flat, row-major).
+const m3 = {
+  diag: (d) => [d, 0, 0, 0, d, 0, 0, 0, d],
+  add: (a, b) => a.map((x, i) => x + b[i]),
+  scale: (a, s) => a.map((x) => x * s),
+  mulv: (a, v) => [
+    a[0] * v[0] + a[1] * v[1] + a[2] * v[2],
+    a[3] * v[0] + a[4] * v[1] + a[5] * v[2],
+    a[6] * v[0] + a[7] * v[1] + a[8] * v[2],
+  ],
+  inv: (a) => {
+    const c0 = a[4] * a[8] - a[5] * a[7], c1 = a[5] * a[6] - a[3] * a[8], c2 = a[3] * a[7] - a[4] * a[6];
+    const det = a[0] * c0 + a[1] * c1 + a[2] * c2;
+    if (!(Math.abs(det) > 1e-300)) return null;
+    const k = 1 / det;
+    return [
+      c0 * k, (a[2] * a[7] - a[1] * a[8]) * k, (a[1] * a[5] - a[2] * a[4]) * k,
+      c1 * k, (a[0] * a[8] - a[2] * a[6]) * k, (a[2] * a[3] - a[0] * a[5]) * k,
+      c2 * k, (a[1] * a[6] - a[0] * a[7]) * k, (a[0] * a[4] - a[1] * a[3]) * k,
+    ];
+  },
+};
+
+// The drone's map: the true course with every gate knocked out of place.
+function makeMap(course, seed) {
+  const rand = mulberry32((seed * 7919 + 13) | 0), E = MAP_ERROR;
+  return {
+    gates: course.gates.map((g) => {
+      const ang = rand() * Math.PI * 2, mag = E.shift[0] + (E.shift[1] - E.shift[0]) * rand();
+      const along = (rand() * 2 - 1) * E.along, yaw = (rand() * 2 - 1) * E.yaw;
+      const pos = v3.add(
+        v3.add(g.pos, v3.scale(g.right, mag * Math.cos(ang))),
+        v3.add(v3.scale(g.up, mag * Math.sin(ang) * E.vertical), v3.scale(g.normal, along))
+      );
+      pos[1] = Math.max(pos[1], 2.2);
+      const c = Math.cos(yaw), s = Math.sin(yaw), n = g.normal;
+      const b = gateFrame({ id: g.id, pos, normal: [n[0] * c + n[2] * s, n[1], -n[0] * s + n[2] * c] });
+      b.mapPos = pos.slice();
+      b.info = m3.diag(1 / (E.sigma * E.sigma)); // information matrix of the estimate
+      b.infoVec = m3.mulv(b.info, pos);
+      b.cov = m3.diag(E.sigma * E.sigma);
+      b.streak = 0;
+      return b;
+    }),
+  };
+}
+
+// Standard normal sample (Box-Muller) from a uniform generator.
+function gauss(rand) {
+  return Math.sqrt(-2 * Math.log(rand() || 1e-12)) * Math.cos(2 * Math.PI * rand());
+}
+
+// Fuse a gate-centre measurement z (covariance C) into the belief b, unless it fails the
+// innovation gate. Static gates make this an information filter: add up information.
+function fuse(b, z, C) {
+  const R = m3.scale(C, VISION.inflate), y = v3.sub(z, b.pos);
+  const Si = m3.inv(m3.add(b.cov, R));
+  if (!Si) return false;
+  if (v3.dot(y, m3.mulv(Si, y)) > VISION.chi2Gate) {
+    // a run of rejections means the belief itself has gone wrong: start again from here
+    if (++b.streak >= VISION.resetAfter) {
+      b.info = m3.diag(1 / (MAP_ERROR.sigma * MAP_ERROR.sigma));
+      b.infoVec = m3.mulv(b.info, z);
+      b.cov = m3.inv(b.info);
+      b.pos = z.slice();
+      b.streak = 0;
+    }
+    return false;
+  }
+  const Ri = m3.inv(R);
+  if (!Ri) return false;
+  b.streak = 0;
+  b.info = m3.add(b.info, Ri);
+  b.infoVec = v3.add(b.infoVec, m3.mulv(Ri, z));
+  b.cov = m3.inv(b.info);
+  b.pos = m3.mulv(b.cov, b.infoVec);
+  return true;
+}
+
+// One camera frame: detect, fit, gate, fuse, and re-plan if the picture has changed.
+function visionFrame(sim) {
+  const V = sim.vision, C = CAMERA, cam = cameraPose(sim.drone);
+  const tanV = Math.tan(C.vfov / 2), tanH = tanV * C.aspect, px = (2 * tanV) / C.heightPx;
+  const dets = [];
+  for (const g of sim.course.gates) {
+    // what the camera really sees: the true gates
+    const d = v3.sub(g.pos, cam.pos), range = v3.len(d);
+    if (range > C.maxRange || range < 2) continue;
+    if (Math.abs(v3.dot(g.normal, d)) < C.minFacing * range) continue;
+    const uv = [];
+    for (const p of gateCorners(g)) {
+      const q = project(cam, p);
+      if (!q || Math.abs(q[0]) > tanH || Math.abs(q[1]) > tanV) break;
+      uv.push(q);
+    }
+    if (uv.length < 4) continue;
+    // the detector: noise on every corner, now and then a lost corner or a wild one
+    let lost = false;
+    for (const q of uv) {
+      q[0] += gauss(V.rand) * C.noisePx * px;
+      q[1] += gauss(V.rand) * C.noisePx * px;
+      if (V.rand() < C.dropout) lost = true;
+    }
+    if (lost) { V.stats.lost++; continue; }
+    const wild = V.rand() < C.outlierRate;
+    if (wild) {
+      const q = uv[Math.floor(V.rand() * 4)];
+      q[0] += (V.rand() < 0.5 ? -1 : 1) * C.outlierPx * px;
+      q[1] += (V.rand() < 0.5 ? -1 : 1) * C.outlierPx * px;
+    }
+    const b = sim.belief.gates[g.id];
+    const fit = solveGatePose(cam, uv, b, C.noisePx * px);
+    const ok = !!fit && fit.chi2 < VISION.chi2Fit && fuse(b, fit.pos, fit.cov);
+    V.stats[ok ? 'accepted' : 'rejected']++;
+    if (wild) V.stats.wild++;
+    if (wild && !ok) V.stats.wildRejected++;
+    // each measured corner as a world point (its ray, at the true corner's depth), so the
+    // onboard overlay can draw it against the live view
+    const world = gateCorners(g).map((p, j) => {
+      const z = v3.dot(v3.sub(p, cam.pos), cam.fwd);
+      return v3.add(cam.pos, v3.scale(v3.add(cam.fwd, v3.add(v3.scale(cam.right, uv[j][0]), v3.scale(cam.up, uv[j][1]))), z));
+    });
+    dets.push({ gate: g.id, uv, world, ok, wild });
+  }
+  V.frame = { t: sim.t, dets };
+  V.stats.frames++;
+  // re-plan once the estimates have moved enough from the ones the plan was built on
+  if (sim.pilot !== 'pursuit' && sim.t - V.lastPlan >= VISION.replanEvery) {
+    const shift = Math.max(...sim.belief.gates.map((b, i) => v3.len(v3.sub(b.pos, V.planned[i]))));
+    if (shift >= VISION.replanShift) replan(sim);
+  }
+}
+
+function replan(sim) {
+  const V = sim.vision, s = sim.plan.pts[sim.track.idx].s;
+  const plan = planRacingLine(sim.belief);
+  sim.plan = plan;
+  sim.track.idx = nearestIndex(plan, sim.drone.pos, Math.round(s / plan.ds) % plan.pts.length, 60, 60);
+  sim.planVersion++;
+  V.planned = sim.belief.gates.map((b) => b.pos.slice());
+  V.lastPlan = sim.t;
+  V.stats.replans++;
+}
+
 // ---------- simulation ----------
 export const PILOTS = ['racing', 'pursuit'];
 
-export function makeSim({ seed = 1, gates, pilot = 'racing', difficulty = 'normal' } = {}) {
+// nav: 'truth' flies from the true gate positions; 'vision' starts from a map with every
+// gate moved and corrects it with the camera; 'blind' trusts the map and nothing else.
+export function makeSim({ seed = 1, gates, pilot = 'racing', difficulty = 'normal', nav = 'truth' } = {}) {
   const course = makeCourse({ seed, gates, difficulty });
+  if (!NAV_MODES.includes(nav)) nav = 'truth';
+  const belief = nav === 'truth' ? null : makeMap(course, seed);
   const drone = makeDrone(course);
-  const plan = planRacingLine(course);
+  const plan = planRacingLine(belief ?? course);
   if (course.difficulty !== 'normal') {
     // take off from the ground under the racing line, 18 m before the start gate, so the
     // first gate is a straight climb along the line even when the course curves into it
@@ -369,7 +731,19 @@ export function makeSim({ seed = 1, gates, pilot = 'racing', difficulty = 'norma
     course,
     drone,
     pilot,
+    nav,
+    belief, // what the drone believes about the gates (null: it knows the truth)
+    vision: nav === 'vision' ? {
+      rand: mulberry32((seed * 104729 + 7) | 0),
+      clock: 0,
+      frame: null, // latest detections, for the onboard overlay
+      planned: belief.gates.map((b) => b.pos.slice()),
+      lastPlan: 0,
+      stats: { frames: 0, accepted: 0, rejected: 0, lost: 0, wild: 0, wildRejected: 0, replans: 0 },
+    } : null,
     plan,
+    planVersion: 0,
+    launchAt: nav === 'vision' ? VISION.lookFirst : 0, // vision takes a look before it goes
     track: { idx: nearestIndex(plan, drone.pos, 0, 0, plan.pts.length) },
     t: 0,
     state: { target: 0, gatesPassed: 0, misses: 0, lap: 0, lapStart: null, laps: [] },
@@ -379,7 +753,10 @@ export function makeSim({ seed = 1, gates, pilot = 'racing', difficulty = 'norma
 
 export function step(sim, dt) {
   const { drone, course, state } = sim;
-  const want = sim.pilot === 'pursuit' ? autopilot(drone, course, state) : racingPilot(sim);
+  const want =
+    sim.t < sim.launchAt ? [0, G, 0] // sitting on the pad
+      : sim.pilot === 'pursuit' ? autopilot(drone, sim.belief ?? course, state)
+        : racingPilot(sim);
   const cmd = limitThrust(want);
 
   // first-order lag towards the commanded thrust
@@ -427,6 +804,10 @@ export function step(sim, dt) {
     }
   }
   sim.t += dt;
+  if (sim.vision && (sim.vision.clock += dt) >= 1 / CAMERA.rate - 1e-9) {
+    sim.vision.clock -= 1 / CAMERA.rate;
+    visionFrame(sim);
+  }
 }
 
 // Roll/pitch for rendering: tilt the body so its up axis matches the thrust vector.

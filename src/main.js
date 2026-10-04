@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { makeSim, step, GATE_INNER, v3, DIFFICULTIES } from './sim.js';
+import { makeSim, step, GATE_INNER, v3, DIFFICULTIES, NAV_MODES } from './sim.js';
 
 const DT = 1 / 120;
 const $ = (id) => document.getElementById(id);
@@ -50,7 +50,8 @@ let camMode = 'chase'; // chase | orbit | fpv
 const CAM_MODES = ['chase', 'orbit', 'fpv'];
 
 // ---------- world objects (rebuilt per course) ----------
-let sim, seed = 1, difficulty = 'normal', pilot = 'racing', world = new THREE.Group(), racingLine = null;
+let sim, seed = 1, difficulty = 'normal', pilot = 'racing', nav = 'truth', world = new THREE.Group(), racingLine = null;
+let ghosts = [], lineVersion = -1;
 scene.add(world);
 
 const gateMatIdle = new THREE.MeshStandardMaterial({ color: '#d9e2ef', roughness: 0.5, metalness: 0.1 });
@@ -93,6 +94,22 @@ function makeLegs(gate) {
   return legs;
 }
 
+// "Ghost" gates: where the drone believes each gate is (vision and map-only modes).
+// Thin cyan frames drawn on top of everything, like an AR overlay.
+const ghostMat = new THREE.MeshBasicMaterial({ color: '#4dd2ff', transparent: true, opacity: 0.85, depthTest: false });
+function makeGhost(b) {
+  const g = new THREE.Group(), s = GATE_INNER, t = 0.07;
+  for (const [w, h, x, y] of [[s + t, t, 0, s / 2], [s + t, t, 0, -s / 2], [t, s + t, s / 2, 0], [t, s + t, -s / 2, 0]]) {
+    const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, t), ghostMat);
+    m.position.set(x, y, 0);
+    m.renderOrder = 10;
+    g.add(m);
+  }
+  g.position.set(...b.pos);
+  g.lookAt(b.pos[0] + b.normal[0], b.pos[1] + b.normal[1], b.pos[2] + b.normal[2]);
+  return g;
+}
+
 function setGateMat(i, mat) {
   gateMeshes[i].children.forEach((c, k) => { if (k < 4) c.material = mat; });
 }
@@ -103,7 +120,7 @@ function buildWorld() {
   world = new THREE.Group();
   scene.add(world);
 
-  sim = makeSim({ seed, pilot, difficulty });
+  sim = makeSim({ seed, pilot, difficulty, nav });
   writeHash();
   gateMeshes = sim.course.gates.map((g) => {
     const m = makeGate(g);
@@ -111,24 +128,14 @@ function buildWorld() {
     return m;
   });
   setGateMat(0, gateMatNext);
-
-  // planned racing line, coloured by planned speed (blue = braking for a turn, orange = flat out)
-  const plan = sim.plan;
-  const linePos = new Float32Array(plan.pts.length * 3);
-  const lineCol = new Float32Array(plan.pts.length * 3);
-  const vLo = Math.min(...plan.pts.map((q) => q.v)), vHi = Math.max(...plan.pts.map((q) => q.v));
-  const slow = new THREE.Color('#3d8bff'), fast = new THREE.Color('#ff8a3d'), c = new THREE.Color();
-  plan.pts.forEach((q, i) => {
-    linePos.set(q.p, i * 3);
-    c.copy(slow).lerp(fast, (q.v - vLo) / Math.max(1e-6, vHi - vLo));
-    lineCol.set([c.r, c.g, c.b], i * 3);
+  ghosts = (sim.belief?.gates ?? []).map((b) => {
+    const ghost = makeGhost(b);
+    world.add(ghost);
+    return ghost;
   });
-  const lineGeo = new THREE.BufferGeometry();
-  lineGeo.setAttribute('position', new THREE.BufferAttribute(linePos, 3));
-  lineGeo.setAttribute('color', new THREE.BufferAttribute(lineCol, 3));
-  racingLine = new THREE.LineLoop(lineGeo, new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.75 }));
-  racingLine.visible = pilot === 'racing';
-  world.add(racingLine);
+  racingLine = null;
+  drawRacingLine();
+  showNavNote();
 
   // scenery for parallax: scattered pillars away from the course
   const rand = mulberry(seed * 7919);
@@ -154,6 +161,33 @@ function buildWorld() {
   trailCount = 0;
   lastEvents = 0;
   updateHud(true);
+}
+
+// Planned racing line, coloured by planned speed (blue = braking for a turn, orange = flat
+// out). Redrawn whenever vision re-plans it.
+const lineMat = new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.75 });
+function drawRacingLine() {
+  if (racingLine) {
+    world.remove(racingLine);
+    racingLine.geometry.dispose();
+  }
+  const plan = sim.plan;
+  const linePos = new Float32Array(plan.pts.length * 3);
+  const lineCol = new Float32Array(plan.pts.length * 3);
+  const vLo = Math.min(...plan.pts.map((q) => q.v)), vHi = Math.max(...plan.pts.map((q) => q.v));
+  const slow = new THREE.Color('#3d8bff'), fast = new THREE.Color('#ff8a3d'), c = new THREE.Color();
+  plan.pts.forEach((q, i) => {
+    linePos.set(q.p, i * 3);
+    c.copy(slow).lerp(fast, (q.v - vLo) / Math.max(1e-6, vHi - vLo));
+    lineCol.set([c.r, c.g, c.b], i * 3);
+  });
+  const lineGeo = new THREE.BufferGeometry();
+  lineGeo.setAttribute('position', new THREE.BufferAttribute(linePos, 3));
+  lineGeo.setAttribute('color', new THREE.BufferAttribute(lineCol, 3));
+  racingLine = new THREE.LineLoop(lineGeo, lineMat);
+  racingLine.visible = pilot === 'racing';
+  world.add(racingLine);
+  lineVersion = sim.planVersion;
 }
 
 // ---------- drone model ----------
@@ -221,14 +255,22 @@ function updateHud(force) {
   $('s-last').textContent = fmt(s.laps.at(-1));
   $('s-best').textContent = fmt(s.laps.length ? Math.min(...s.laps) : null);
   $('s-speed').textContent = `${(v3.len(sim.drone.vel) * 3.6).toFixed(0)} km/h`;
-  $('s-gates').textContent = s.gatesPassed;
+  $('s-gates').textContent = s.misses ? `${s.gatesPassed} · ${s.misses} missed` : s.gatesPassed;
   $('s-plan').textContent = pilot === 'racing' ? fmt(sim.plan.lapTime) : '–';
   $('s-course').textContent = `#${seed} ${difficulty}`;
+  // vision: how far out the map is for the next gate, and how far out the estimate is now
+  $('r-vis').hidden = $('s-vis').hidden = !sim.belief;
+  if (sim.belief) {
+    const g = sim.course.gates[s.target], b = sim.belief.gates[s.target];
+    const mapErr = v3.len(v3.sub(b.mapPos, g.pos)), estErr = v3.len(v3.sub(b.pos, g.pos));
+    $('s-vis').textContent = sim.vision ? `${mapErr.toFixed(1)} → ${estErr.toFixed(2)} m` : `${mapErr.toFixed(1)} m out`;
+  }
   if (force) return;
   for (; lastEvents < sim.events.length; lastEvents++) {
     const e = sim.events[lastEvents];
     if (e.type === 'lap') toast(`Lap ${fmt(e.time)}`);
     if (e.type === 'gate') onGate(e.gate);
+    if (e.type === 'miss') toast(`Missed gate ${e.gate + 1}`, true);
   }
 }
 function onGate(id) {
@@ -239,12 +281,28 @@ function onGate(id) {
   if (id === 0) setGateMat(n - 1, gateMatIdle);
 }
 let toastTimer;
-function toast(msg) {
+function toast(msg, bad = false) {
   const el = $('toast');
   el.textContent = msg;
+  el.classList.toggle('bad', bad);
   el.classList.add('show');
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => el.classList.remove('show'), 1300);
+}
+
+// A short note on what the nav mode shows, faded out after a while.
+const NAV_NOTES = {
+  vision: '<b>Vision.</b> The drone\'s map has every gate up to 2.6 m out. Its camera finds the real gates (corner boxes in the onboard view) and it re-plans through its estimates (cyan).',
+  blind: '<b>Map only.</b> The drone trusts a map with every gate up to 2.6 m out (cyan), so it misses gates.',
+};
+let noteTimer;
+function showNavNote() {
+  const el = $('nav-note');
+  el.innerHTML = NAV_NOTES[nav] ?? '';
+  el.hidden = !NAV_NOTES[nav];
+  el.classList.remove('fade');
+  clearTimeout(noteTimer);
+  noteTimer = setTimeout(() => el.classList.add('fade'), 12000);
 }
 
 // ---------- controls ----------
@@ -263,32 +321,40 @@ $('b-diff').onclick = () => {
   syncButtons();
   buildWorld();
 };
+$('b-nav').onclick = () => {
+  nav = NAV_MODES[(NAV_MODES.indexOf(nav) + 1) % NAV_MODES.length];
+  syncButtons();
+  buildWorld();
+};
 $('b-share').onclick = () => {
   const url = location.href;
   if (navigator.clipboard?.writeText) {
-    navigator.clipboard.writeText(url).then(() => toast('Link copied'), () => toast(`#seed=${seed}&d=${difficulty}`));
-  } else toast(`#seed=${seed}&d=${difficulty}`);
+    navigator.clipboard.writeText(url).then(() => toast('Link copied'), () => toast(location.hash));
+  } else toast(location.hash);
 };
+const NAV_LABELS = { truth: 'ground truth', vision: 'vision', blind: 'map only' };
 function syncButtons() {
   $('b-diff').textContent = `Course: ${difficulty}`;
+  $('b-nav').textContent = `Nav: ${NAV_LABELS[nav]}`;
 }
 
-// ---------- shareable course in the URL: #seed=12&d=hard ----------
+// ---------- shareable course in the URL: #seed=12&d=hard&nav=vision ----------
 function readHash() {
   const p = new URLSearchParams(location.hash.slice(1));
   const n = parseInt(p.get('seed'), 10);
   seed = Number.isInteger(n) && n > 0 && n < 1e9 ? n : 1;
   difficulty = DIFFICULTIES.includes(p.get('d')) ? p.get('d') : 'normal';
+  nav = NAV_MODES.includes(p.get('nav')) ? p.get('nav') : 'truth';
   syncButtons();
 }
 function writeHash() {
-  const h = `#seed=${seed}&d=${difficulty}`;
+  const h = `#seed=${seed}&d=${difficulty}${nav === 'truth' ? '' : `&nav=${nav}`}`;
   if (location.hash !== h) history.replaceState(null, '', h);
 }
 addEventListener('hashchange', () => {
-  const before = `${seed}/${difficulty}`;
+  const before = `${seed}/${difficulty}/${nav}`;
   readHash();
-  if (`${seed}/${difficulty}` !== before) buildWorld();
+  if (`${seed}/${difficulty}/${nav}` !== before) buildWorld();
 });
 $('b-pilot').onclick = () => {
   pilot = pilot === 'racing' ? 'pursuit' : 'racing';
@@ -300,12 +366,72 @@ addEventListener('keydown', (e) => {
   if (e.key === 'n') $('b-course').click();
   if (e.key === 'p') $('b-pilot').click();
   if (e.key === 'd') $('b-diff').click();
+  if (e.key === 'v') $('b-nav').click();
 });
+
+// ---------- onboard overlay: what the camera detected this frame ----------
+const overlay = $('overlay'), octx = overlay.getContext('2d');
+let overlayDpr = 1, overlayDrawn = false;
+function sizeOverlay() {
+  overlayDpr = Math.min(devicePixelRatio, 2);
+  overlay.width = Math.round(innerWidth * overlayDpr);
+  overlay.height = Math.round(innerHeight * overlayDpr);
+  overlayDrawn = true; // resizing clears the canvas; make sure it is redrawn
+}
+sizeOverlay();
+const ovV = new THREE.Vector3();
+// Screen position (CSS px) of a world point in the onboard view drawn in rect, or null.
+function toScreen(p, rect) {
+  ovV.set(p[0], p[1], p[2]).applyMatrix4(fpvCam.matrixWorldInverse);
+  if (ovV.z > -0.2) return null; // behind the camera
+  ovV.applyMatrix4(fpvCam.projectionMatrix);
+  return [rect.x + ((ovV.x + 1) / 2) * rect.w, rect.top + ((1 - ovV.y) / 2) * rect.h];
+}
+function drawOverlay(rect, label) {
+  const frame = sim.vision?.frame;
+  if (!frame && !overlayDrawn) return;
+  octx.setTransform(1, 0, 0, 1, 0, 0);
+  octx.clearRect(0, 0, overlay.width, overlay.height);
+  overlayDrawn = !!frame;
+  if (!frame) return;
+  octx.setTransform(overlayDpr, 0, 0, overlayDpr, 0, 0);
+  octx.save();
+  octx.beginPath();
+  octx.rect(rect.x, rect.top, rect.w, rect.h);
+  octx.clip();
+  octx.lineWidth = 1.5;
+  let found = 0;
+  const fresh = sim.t - frame.t < 0.2;
+  for (const det of fresh ? frame.dets : []) {
+    const pts = det.world.map((p) => toScreen(p, rect));
+    if (pts.some((q) => !q)) continue;
+    if (det.ok) found++;
+    const col = det.ok ? '#3ddc97' : '#ff5c5c';
+    octx.strokeStyle = col;
+    octx.beginPath();
+    pts.forEach(([x, y], i) => (i ? octx.lineTo(x, y) : octx.moveTo(x, y)));
+    octx.closePath();
+    octx.globalAlpha = 0.45;
+    octx.stroke();
+    octx.globalAlpha = 1;
+    for (const [x, y] of pts) octx.strokeRect(x - 3.5, y - 3.5, 7, 7);
+  }
+  octx.restore();
+  if (label) {
+    octx.font = '600 11px ui-sans-serif, system-ui, sans-serif';
+    octx.fillStyle = 'rgba(11, 18, 32, .6)';
+    octx.fillRect(label.x, label.y, 112, 18);
+    octx.fillStyle = found ? '#3ddc97' : '#8fa0b8';
+    octx.fillText(`VISION · ${found} gate${found === 1 ? '' : 's'}`, label.x + 6, label.y + 13);
+  }
+}
 
 // ---------- main loop ----------
 const tmpV = new THREE.Vector3(), tmpQ = new THREE.Quaternion(), yawQ = new THREE.Quaternion();
 const UP = new THREE.Vector3(0, 1, 0);
-let acc = 0, last = performance.now(), propSpin = 0;
+let acc = 0, last = performance.now(), propSpin = 0, frameNo = 0;
+const controls = document.querySelector('.controls');
+let controlsTop = controls.getBoundingClientRect().top;
 
 function syncDrone() {
   const d = sim.drone;
@@ -335,6 +461,7 @@ function updateCameras(dtFrame) {
 }
 
 function frame(now) {
+  frameNo++;
   const dtFrame = Math.min(0.1, (now - last) / 1000);
   last = now;
   acc += dtFrame * timeScale;
@@ -349,6 +476,8 @@ function frame(now) {
   propSpin += dtFrame * 60;
   updateCameras(dtFrame);
   updateHud();
+  if (sim.planVersion !== lineVersion) drawRacingLine();
+  ghosts.forEach((g, i) => g.position.set(...sim.belief.gates[i].pos));
 
   const W = innerWidth, H = innerHeight;
   renderer.setScissorTest(false);
@@ -359,12 +488,14 @@ function frame(now) {
     drone.visible = false;
     renderer.render(scene, fpvCam);
     drone.visible = true;
+    drawOverlay({ x: 0, top: 0, w: W, h: H }, W >= 700 ? { x: W / 2 - 56, y: 16 } : null);
     $('fpv-label').style.display = 'none';
   } else {
     renderer.render(scene, chaseCam);
-    // picture-in-picture onboard view
-    const w = Math.round(Math.min(W * 0.3, 360)), h = Math.round(w * 9 / 16);
-    const x = W - w - 14, y = Math.max(78, H * 0.12);
+    // picture-in-picture onboard view, kept clear of the control buttons
+    if (frameNo % 30 === 0) controlsTop = controls.getBoundingClientRect().top;
+    const w = Math.round(Math.min(Math.max(W * 0.3, 160), 360)), h = Math.round(w * 9 / 16);
+    const x = W - w - 14, y = Math.max(78, H * 0.12, H - controlsTop + 10);
     fpvCam.aspect = w / h;
     fpvCam.updateProjectionMatrix();
     renderer.setScissorTest(true);
@@ -373,6 +504,7 @@ function frame(now) {
     drone.visible = false;
     renderer.render(scene, fpvCam);
     drone.visible = true;
+    drawOverlay({ x, top: H - y - h, w, h }, w >= 180 ? { x: x + 6, y: H - y - h + 6 } : null);
     const lbl = $('fpv-label');
     lbl.style.display = 'block';
     lbl.style.bottom = `${y + h + 4}px`;
@@ -382,6 +514,8 @@ function frame(now) {
 
 addEventListener('resize', () => {
   renderer.setSize(innerWidth, innerHeight);
+  sizeOverlay();
+  controlsTop = controls.getBoundingClientRect().top;
   chaseCam.aspect = innerWidth / innerHeight;
   chaseCam.updateProjectionMatrix();
 });

@@ -21,7 +21,8 @@
       padding: 10px 14px; backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); }
     .title { font-weight: 700; letter-spacing: .02em; }
     .title small { display: block; color: var(--muted); font-weight: 400; font-size: 12px; margin-top: 2px; }
-    .stats { display: grid; grid-template-columns: auto auto; gap: 2px 14px; font-variant-numeric: tabular-nums; }
+    .stats { display: grid; grid-template-columns: auto auto; gap: 2px 14px; font-variant-numeric: tabular-nums;
+      flex-shrink: 0; white-space: nowrap; }
     .stats span:nth-child(odd) { color: var(--muted); font-size: 12px; align-self: center; }
     .stats b { font-weight: 600; text-align: right; }
     .controls { position: fixed; left: 12px; right: 12px; bottom: max(12px, env(safe-area-inset-bottom));
@@ -35,16 +36,27 @@
     .toast { position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); font-size: 28px; font-weight: 700;
       color: var(--ok); opacity: 0; transition: opacity .4s; pointer-events: none; text-shadow: 0 2px 12px rgba(0,0,0,.6); }
     .toast.show { opacity: 1; }
+    .toast.bad { color: #ff5c5c; }
+    .overlay { position: fixed; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+    .col { display: flex; flex-direction: column; gap: 8px; max-width: 300px; min-width: 0; }
+    .note { font-size: 12px; line-height: 1.4; color: var(--muted); transition: opacity 1.2s; }
+    .note b { color: #4dd2ff; font-weight: 600; }
+    .note.fade { opacity: 0; }
+    [hidden] { display: none !important; }
     .err { position: fixed; inset: 0; display: none; place-items: center; padding: 24px; text-align: center; color: var(--muted); }
-    @media (max-width: 560px) { .title small { display: none; } .stats { font-size: 13px; } }
+    @media (max-width: 560px) { .title small { display: none; } .stats { font-size: 13px; } .note { font-size: 11px; } }
   </style>
   <script type="importmap">
     { "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }
   </script>
 </head>
 <body>
+  <canvas class="overlay" id="overlay"></canvas>
   <div class="hud">
-    <div class="panel title">Drone Sim<small>Self-flying racer · built overnight by Claude</small></div>
+    <div class="col">
+      <div class="panel title">Drone Sim<small>Self-flying racer · built overnight by Claude</small></div>
+      <div class="panel note" id="nav-note" hidden></div>
+    </div>
     <div class="panel stats" aria-live="polite">
       <span>Lap</span><b id="s-lap">–</b>
       <span>Last</span><b id="s-last">–</b>
@@ -53,6 +65,7 @@
       <span>Gates</span><b id="s-gates">0</b>
       <span>Plan</span><b id="s-plan">–</b>
       <span>Course</span><b id="s-course">–</b>
+      <span id="r-vis" hidden>Vision</span><b id="s-vis" hidden>–</b>
     </div>
   </div>
   <div class="fpv-label" id="fpv-label">Onboard camera</div>
@@ -62,6 +75,7 @@
     <button id="b-speed">Speed: 1×</button>
     <button id="b-pilot">Pilot: racing line</button>
     <button id="b-diff">Course: normal</button>
+    <button id="b-nav">Nav: ground truth</button>
     <button id="b-course">New course</button>
     <button id="b-share">Share</button>
   </div>

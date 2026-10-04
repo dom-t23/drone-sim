@@ -12,8 +12,9 @@ A rough backlog, not a contract. Each night picks the item that will make the bi
 - [ ] **Crashes.** Gate-frame and pillar collisions, with a tumble and respawn.
 
 ## Seeing
-- [ ] **Vision mode, step 1.** A synthetic camera in `sim.js` that projects the next gate's corners into the onboard image with noise and occlusion, then estimates the gate pose (PnP) and flies from that estimate instead of ground truth. Overlay the detections on the onboard view.
-- [ ] **Vision mode, step 2.** Estimator: fuse vision with IMU-like acceleration (an EKF), with innovation gating, and plot the estimate against the truth.
+- [x] **Vision mode, step 1.** Map with every gate moved up to 2.6 m; synthetic onboard camera (corner noise, dropouts, wild corners); PnP by Levenberg-Marquardt; misfit check + innovation gating; per-gate information filter; in-flight re-planning; detection overlay, ghost gates and map-only comparison mode (2026-10-04).
+  - **Next steps:** real occlusion (gate frames and pillars hiding corners) instead of random dropouts; fuse gate orientation as well as position; data association without known gate IDs (match detections to the nearest predicted gate); a motion-blur/latency model.
+- [ ] **Vision mode, step 2.** Estimator: the drone's own state is still ground truth. Add an EKF fusing IMU-like acceleration with the gate detections (each detected gate is a known-ish landmark), reuse the innovation gating, and plot the estimate against the truth. Start the map error and the state error together so they have to be solved jointly.
 - [ ] **Vision mode, step 3.** Detect the gate from the actual rendered pixels (colour segmentation and corner finding on a downscaled onboard frame).
 
 ## Racing
