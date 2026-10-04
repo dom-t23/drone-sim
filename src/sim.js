@@ -24,23 +24,86 @@ export const v3 = {
 // ---------- course ----------
 export const GATE_INNER = 3.2; // inner opening width/height, metres
 
-// A closed loop of gates whose normals follow the direction of travel.
-export function makeCourse({ gates = 10, seed = 1 } = {}) {
+// Course presets. 'normal' is the original layout and must stay byte-for-byte the same
+// (tests and shared links depend on it); the others draw extra random numbers after it.
+export const DIFFICULTIES = ['easy', 'normal', 'hard'];
+const DEG = Math.PI / 180;
+const MAX_PITCH = 30 * DEG; // steepest gate a course may contain
+
+// A closed loop of gates. Each gate stores its facing (normal) plus the in-plane
+// right/up axes used for the "did it go through the opening" check, so gates may be
+// yawed off the direction of travel or pitched (dive gates).
+export function makeCourse({ gates, seed = 1, difficulty = 'normal' } = {}) {
+  if (!DIFFICULTIES.includes(difficulty)) difficulty = 'normal';
   const rand = mulberry32(seed);
   const phase = rand() * Math.PI * 2;
-  const curve = (t) => {
-    const r = 45 + 14 * Math.sin(2 * t + phase);
-    return [r * Math.cos(t), 5 + 3 * Math.sin(3 * t + phase), r * Math.sin(t)];
-  };
+  let curve, count, angle = () => ({ yaw: 0, pitch: 0 }), follow3d = false;
+  if (difficulty === 'easy') {
+    count = gates ?? 8;
+    curve = (t) => {
+      const r = 48 + 7 * Math.sin(2 * t + phase);
+      return [r * Math.cos(t), 4.5 + 1.2 * Math.sin(2 * t + phase), r * Math.sin(t)];
+    };
+  } else if (difficulty === 'hard') {
+    count = gates ?? 12;
+    const p2 = rand() * Math.PI * 2, p3 = rand() * Math.PI * 2;
+    curve = (t) => {
+      const r = 40 + 12 * Math.sin(2 * t + phase) + 6 * Math.sin(3 * t + p2);
+      const y = 8.5 + 4 * Math.sin(2 * t + p3) + 1.4 * Math.sin(5 * t + phase);
+      return [r * Math.cos(t), Math.max(3.4, y), r * Math.sin(t)];
+    };
+    follow3d = true; // gates pitch with the climbs and drops
+    // every gate is set at an angle to the line of flight; descending gates tip into a dive
+    angle = (i, slope) => ({
+      yaw: (rand() < 0.5 ? -1 : 1) * (10 + 15 * rand()) * DEG,
+      pitch: slope < -0.08 ? -(8 + 10 * rand()) * DEG : 0,
+    });
+  } else {
+    count = gates ?? 10;
+    curve = (t) => {
+      const r = 45 + 14 * Math.sin(2 * t + phase);
+      return [r * Math.cos(t), 5 + 3 * Math.sin(3 * t + phase), r * Math.sin(t)];
+    };
+  }
   const list = [];
-  for (let i = 0; i < gates; i++) {
-    const t = (i / gates) * Math.PI * 2;
+  for (let i = 0; i < count; i++) {
+    const t = (i / count) * Math.PI * 2;
     const p = curve(t);
     const ahead = curve(t + 0.01);
-    const n = v3.norm([ahead[0] - p[0], 0, ahead[2] - p[2]]); // horizontal facing
+    const dir = v3.sub(ahead, p);
+    let n = v3.norm([dir[0], 0, dir[2]]); // horizontal facing
+    const slope = dir[1] / Math.hypot(dir[0], dir[2]);
+    const { yaw, pitch } = angle(i, slope);
+    if (yaw || pitch || follow3d) {
+      const c = Math.cos(yaw), s = Math.sin(yaw);
+      const h = [n[0] * c + n[2] * s, 0, -n[0] * s + n[2] * c];
+      const th = Math.max(-MAX_PITCH, Math.min(MAX_PITCH, (follow3d ? Math.atan(slope) : 0) + pitch));
+      n = [h[0] * Math.cos(th), Math.sin(th), h[2] * Math.cos(th)];
+    }
     list.push({ id: i, pos: p, normal: n });
   }
-  return { gates: list, curve };
+  if (follow3d) {
+    // start the lap at the lowest gate, set level and square-on, so the launch from
+    // the ground can always make it
+    const lo = list.reduce((b, g, i) => (g.pos[1] < list[b].pos[1] ? i : b), 0);
+    list.push(...list.splice(0, lo));
+    list.forEach((g, i) => (g.id = i));
+    const t0 = (lo / count) * Math.PI * 2, a = curve(t0 + 0.01), p = list[0].pos;
+    list[0].normal = v3.norm([a[0] - p[0], 0, a[2] - p[2]]);
+  }
+  return { gates: list.map(gateFrame), curve, seed, difficulty };
+}
+
+// In-plane axes of a gate: right is horizontal, up completes the frame.
+function gateFrame(g) {
+  const n = g.normal;
+  g.right = v3.norm([n[2], 0, -n[0]]);
+  g.up = [
+    n[1] * g.right[2] - n[2] * g.right[1],
+    n[2] * g.right[0] - n[0] * g.right[2],
+    n[0] * g.right[1] - n[1] * g.right[0],
+  ];
+  return g;
 }
 
 // ---------- drone ----------
@@ -98,12 +161,15 @@ export function autopilot(drone, course, state) {
   const latDist = v3.len(lateral);
 
   let carrot;
-  if (along > -1.0 && latDist > GATE_INNER * 0.5) {
-    // past the plane but outside the opening: go round to the front
+  if (along > 1.0 || (along > -1.0 && latDist > GATE_INNER * 0.5)) {
+    // past the plane without going through (or about to clip the frame): go round to
+    // the front for another approach rather than chasing the axis off into the distance
     carrot = v3.sub(gate.pos, v3.scale(gate.normal, 10));
   } else {
     carrot = v3.add(gate.pos, v3.scale(gate.normal, along + AUTOPILOT.lookahead));
   }
+  // a dive gate's axis runs into the ground beyond it: never chase a point below 2 m
+  if (carrot[1] < 2) carrot = [carrot[0], 2, carrot[2]];
 
   // slow down for sharp direction changes coming up
   const next = course.gates[(state.target + 1) % course.gates.length];
@@ -122,9 +188,10 @@ export function autopilot(drone, course, state) {
 export const RACING = {
   ds: 0.25, // path sample spacing, m
   tangentScale: 1.15, // Hermite tangent length as a fraction of the gate-to-gate distance
-  turnMargin: 0.75, // fraction of the tilt/thrust envelope the planned turns may use
-  aAccel: 7.0, // m/s^2 budget for speeding up along the path
-  aBrake: 9.0, // m/s^2 budget for braking along the path
+  turnMargin: 0.8, // fraction of the tilt/thrust envelope the planned turns may use
+  aAccel: 10.0, // m/s^2 budget for speeding up along the path
+  aBrake: 14.0, // m/s^2 budget for braking along the path
+  comboMargin: 0.9, // fraction of the envelope turn + along-track acceleration may use together
   vMax: 32, // m/s top speed
   kp: 7.0, // 1/s^2, position error gain
   kd: 4.5, // 1/s, velocity error gain
@@ -178,15 +245,19 @@ export function planRacingLine(course, opts = {}) {
     pts[k].kv = v3.scale(v3.add(v3.sub(a, v3.scale(b, 2)), c), 1 / (ds * ds));
   }
   // speed profile: turn limit, then forward (accel) and backward (brake) passes, twice round the loop
+  // Along-track acceleration and braking share the envelope with the turn (a
+  // friction-circle style limit), so a crest or tight corner leaves less for braking.
   const v = pts.map((q) => turnSpeedLimit(q.kv, P));
   for (let pass = 0; pass < 2; pass++) {
     for (let k = 1; k <= N; k++) {
       const i = k % N, h = k - 1;
-      v[i] = Math.min(v[i], Math.sqrt(v[h] * v[h] + 2 * P.aAccel * ds));
+      const acc = alongLimit(pts[h], v[h], P.aAccel, 1, P);
+      v[i] = Math.min(v[i], Math.sqrt(v[h] * v[h] + 2 * acc * ds));
     }
     for (let k = N - 1; k >= 0; k--) {
       const i = k, nx = (k + 1) % N;
-      v[i] = Math.min(v[i], Math.sqrt(v[nx] * v[nx] + 2 * P.aBrake * ds));
+      const brk = alongLimit(pts[i], v[nx], P.aBrake, -1, P);
+      v[i] = Math.min(v[i], Math.sqrt(v[nx] * v[nx] + 2 * brk * ds));
     }
   }
   // along-track acceleration implied by the profile: dv/dt = v dv/ds
@@ -208,6 +279,29 @@ function turnFeasible(kv, v, P) {
   const th = Math.hypot(a[0], a[2]);
   if (ty <= 0) return th < 1e-6 && a[1] + G >= 0;
   return th <= ty * Math.tan(DRONE.maxTiltRad) && Math.hypot(th, a[1] + G) <= DRONE.maxThrustAcc * P.turnMargin;
+}
+// Largest along-track acceleration (dir 1) or braking (dir -1), up to budget, that
+// fits the envelope together with the turn at speed v. Coasting (drag alone, no thrust
+// along the path) is the cheapest way to slow down, so braking searches upwards from it.
+function alongLimit(q, v, budget, dir, P) {
+  const fits = (x) => {
+    const at = dir * x + DRONE.drag * v; // thrust along the path: the speed change plus beating drag
+    return thrustFits(v3.add(v3.scale(q.kv, v * v), v3.scale(q.t, at)), P.comboMargin);
+  };
+  let lo = dir > 0 ? 0 : Math.min(budget, DRONE.drag * v), hi = budget;
+  if (fits(hi)) return hi;
+  if (!fits(lo)) return dir > 0 ? -DRONE.drag * v : lo; // can't even hold speed: coast
+  for (let i = 0; i < 16; i++) {
+    const mid = (lo + hi) / 2;
+    if (fits(mid)) lo = mid; else hi = mid;
+  }
+  return lo;
+}
+// Does path acceleration a (excluding gravity) fit inside a fraction of the envelope?
+function thrustFits(a, margin) {
+  const ty = a[1] + G, th = Math.hypot(a[0], a[2]);
+  if (ty <= 0) return false;
+  return th <= ty * Math.tan(DRONE.maxTiltRad * margin) && Math.hypot(th, ty) <= DRONE.maxThrustAcc * margin;
 }
 function turnSpeedLimit(kv, P) {
   if (turnFeasible(kv, P.vMax, P)) return P.vMax;
@@ -259,10 +353,18 @@ export function racingPilot(sim) {
 // ---------- simulation ----------
 export const PILOTS = ['racing', 'pursuit'];
 
-export function makeSim({ seed = 1, gates = 10, pilot = 'racing' } = {}) {
-  const course = makeCourse({ seed, gates });
+export function makeSim({ seed = 1, gates, pilot = 'racing', difficulty = 'normal' } = {}) {
+  const course = makeCourse({ seed, gates, difficulty });
   const drone = makeDrone(course);
   const plan = planRacingLine(course);
+  if (course.difficulty !== 'normal') {
+    // take off from the ground under the racing line, 18 m before the start gate, so the
+    // first gate is a straight climb along the line even when the course curves into it
+    const N = plan.pts.length;
+    const q = plan.pts[(Math.round((plan.gateS[0] - 18) / plan.ds) + N) % N];
+    drone.pos = [q.p[0], 1.5, q.p[2]];
+    drone.yaw = Math.atan2(q.t[0], q.t[2]);
+  }
   return {
     course,
     drone,
@@ -304,9 +406,8 @@ export function step(sim, dt) {
     const f = a0 / (a0 - a1);
     const hit = v3.add(prev, v3.scale(v3.sub(drone.pos, prev), f));
     const off = v3.sub(hit, gate.pos);
-    const right = [gate.normal[2], 0, -gate.normal[0]];
     const inside =
-      Math.abs(v3.dot(off, right)) < GATE_INNER / 2 && Math.abs(off[1]) < GATE_INNER / 2;
+      Math.abs(v3.dot(off, gate.right)) < GATE_INNER / 2 && Math.abs(v3.dot(off, gate.up)) < GATE_INNER / 2;
     if (inside) {
       state.gatesPassed++;
       sim.events.push({ t: sim.t, type: 'gate', gate: gate.id });

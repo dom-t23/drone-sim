@@ -2,6 +2,15 @@
 
 Newest first. One entry per night's run.
 
+## 2026-10-04: Harder courses
+- **New Course button (or `D`)** switches between **easy**, **normal** and **hard** courses. Hard courses have 12 gates, climbs and drops of 5 m or more, every gate set at an angle to the line of flight, and **dive gates** tipped down by up to 30° on the descents. Easy courses are a gentle 8-gate loop.
+- **Shareable courses**: the address bar now holds the course, e.g. `#seed=12&d=hard`, and the new **Share** button copies the link. Opening a link flies exactly that course. Normal courses keep their old layouts, so seed numbers mean the same as before.
+- The HUD has a new **Course** row (seed and difficulty), and gate legs stay vertical under tilted gates.
+- **The racing line got a little faster, and much more robust.** The speed planner now treats turning and speeding up or braking as sharing one budget (a "friction circle"), so it brakes earlier for corners that come over a crest instead of arriving too fast. That let the flat acceleration and braking limits go up. Normal laps drop from about 17.6 s to about 17.3 s, and the racing pilot clears every gate on 80 random seeds of each difficulty (hard: about 20.8 s a lap).
+- On easy and hard courses the drone takes off under its racing line, and hard laps start at the lowest gate (kept level), so the launch always makes the first gate.
+- Fixed an old bug in the original pursuit pilot: after a near miss it could end up on the gate's axis beyond the gate and chase it off the map. It now turns back for another try, and never aims below 2 m. On hard courses it still misses the odd gate, which shows why the racing line exists.
+- Tests: normal layouts are pinned to the original generator; hard courses must really contain big climbs, angled and dive gates; the racing pilot must fly easy and hard courses with no misses, within 1.2 m of every gate centre and 1 m of its line; lap times must rise with difficulty; the plan must stay above 1.5 m and within the tilt and thrust envelope including its speed changes; and pursuit must recover from misses. The normal lap-time bar tightens from 18.6 s to 17.9 s.
+
 ## 2026-10-03: Racing line
 - **The drone is about 35% faster**: laps drop from about 27.3 s to about 17.6 s on every test seed, still with no missed gates. Top speed goes from 45 km/h to about 80 km/h.
 - The course now shows the **planned racing line**, coloured by planned speed: blue where the drone brakes for a turn, orange where it's flat out.

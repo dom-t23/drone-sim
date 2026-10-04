@@ -3,9 +3,11 @@
 A rough backlog, not a contract. Each night picks the item that will make the biggest visible or technical difference, or something better that isn't listed. Tick items off here and record them in `CHANGELOG.md`. Big items can be split across nights; leave a short **Next steps** note under the item so the next run can carry on.
 
 ## Flying
-- [ ] **Harder courses.** Tighter turns, big height changes, dive gates, a split-S, gates at an angle. Add a difficulty selector and a shareable seed in the URL (`#seed=12&d=hard`).
+- [x] **Harder courses.** Easy / normal / hard selector, shareable `#seed=12&d=hard` URLs, hard courses with big height changes, angled gates and dive gates (2026-10-04).
+  - **Next steps:** a split-S (two stacked gates flown in opposite directions) and other set pieces need the course generator to stop being a single loop around the centre; tighter hairpins. The pursuit pilot misses the odd gate on hard; that's fine as a baseline, but it could slow down more for angled gates.
 - [x] **Faster autopilot.** Racing line (Hermite spline through gate centres plus an envelope-aware speed profile) tracked with feedforward + PD, shown on the course. 27.3 s → 17.6 s a lap (2026-10-03).
-  - **Next steps:** optimise the gate crossing points within each opening and the tangent lengths (e.g. a few rounds of coordinate descent on planned lap time) instead of always aiming at the centre; couple the turn and acceleration budgets (a friction-circle style limit) so the profile can be pushed harder; then try minimum-snap. Retighten the lap-time test after each gain.
+  - Friction-circle coupling of turn and along-track budgets done (2026-10-04): ~17.3 s on normal.
+  - **Next steps:** optimise the gate crossing points within each opening and the tangent lengths (e.g. a few rounds of coordinate descent on planned lap time) instead of always aiming at the centre; then try minimum-snap. Retighten the lap-time test after each gain.
 - [ ] **Wind and disturbances.** Gusts, sensor noise, motor lag variation; the autopilot must stay robust.
 - [ ] **Crashes.** Gate-frame and pillar collisions, with a tumble and respawn.
 

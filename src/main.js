@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { makeSim, step, GATE_INNER, v3 } from './sim.js';
+import { makeSim, step, GATE_INNER, v3, DIFFICULTIES } from './sim.js';
 
 const DT = 1 / 120;
 const $ = (id) => document.getElementById(id);
@@ -50,7 +50,7 @@ let camMode = 'chase'; // chase | orbit | fpv
 const CAM_MODES = ['chase', 'orbit', 'fpv'];
 
 // ---------- world objects (rebuilt per course) ----------
-let sim, seed = 1, pilot = 'racing', world = new THREE.Group(), racingLine = null;
+let sim, seed = 1, difficulty = 'normal', pilot = 'racing', world = new THREE.Group(), racingLine = null;
 scene.add(world);
 
 const gateMatIdle = new THREE.MeshStandardMaterial({ color: '#d9e2ef', roughness: 0.5, metalness: 0.1 });
@@ -73,21 +73,24 @@ function makeGate(gate) {
     m.castShadow = true;
     g.add(m);
   }
-  // support legs down to the ground
-  const legH = gate.pos[1] - s / 2 - t;
-  if (legH > 0.1) {
-    for (const x of [-(s + t) / 2, (s + t) / 2]) {
-      const leg = new THREE.Mesh(
-        new THREE.CylinderGeometry(0.06, 0.06, legH, 8),
-        new THREE.MeshStandardMaterial({ color: '#56657a' })
-      );
-      leg.position.set(x, -s / 2 - t - legH / 2, 0);
-      g.add(leg);
-    }
-  }
   g.position.set(...gate.pos);
   g.lookAt(gate.pos[0] + gate.normal[0], gate.pos[1] + gate.normal[1], gate.pos[2] + gate.normal[2]);
   return g;
+}
+
+// Vertical support legs from the ground to the gate's two bottom corners, in world space
+// so angled and dive gates still stand on straight legs.
+const legMat = new THREE.MeshStandardMaterial({ color: '#56657a' });
+function makeLegs(gate) {
+  const s = GATE_INNER, t = 0.28, legs = [];
+  for (const side of [-1, 1]) {
+    const c = v3.sub(v3.add(gate.pos, v3.scale(gate.right, side * (s + t) / 2)), v3.scale(gate.up, s / 2 + t));
+    if (c[1] < 0.1) continue;
+    const leg = new THREE.Mesh(new THREE.CylinderGeometry(0.06, 0.06, c[1], 8), legMat);
+    leg.position.set(c[0], c[1] / 2, c[2]);
+    legs.push(leg);
+  }
+  return legs;
 }
 
 function setGateMat(i, mat) {
@@ -100,10 +103,11 @@ function buildWorld() {
   world = new THREE.Group();
   scene.add(world);
 
-  sim = makeSim({ seed, pilot });
+  sim = makeSim({ seed, pilot, difficulty });
+  writeHash();
   gateMeshes = sim.course.gates.map((g) => {
     const m = makeGate(g);
-    world.add(m);
+    world.add(m, ...makeLegs(g));
     return m;
   });
   setGateMat(0, gateMatNext);
@@ -219,6 +223,7 @@ function updateHud(force) {
   $('s-speed').textContent = `${(v3.len(sim.drone.vel) * 3.6).toFixed(0)} km/h`;
   $('s-gates').textContent = s.gatesPassed;
   $('s-plan').textContent = pilot === 'racing' ? fmt(sim.plan.lapTime) : '–';
+  $('s-course').textContent = `#${seed} ${difficulty}`;
   if (force) return;
   for (; lastEvents < sim.events.length; lastEvents++) {
     const e = sim.events[lastEvents];
@@ -253,6 +258,38 @@ $('b-speed').onclick = () => {
   $('b-speed').textContent = `Speed: ${timeScale}×`;
 };
 $('b-course').onclick = () => { seed++; buildWorld(); };
+$('b-diff').onclick = () => {
+  difficulty = DIFFICULTIES[(DIFFICULTIES.indexOf(difficulty) + 1) % DIFFICULTIES.length];
+  syncButtons();
+  buildWorld();
+};
+$('b-share').onclick = () => {
+  const url = location.href;
+  if (navigator.clipboard?.writeText) {
+    navigator.clipboard.writeText(url).then(() => toast('Link copied'), () => toast(`#seed=${seed}&d=${difficulty}`));
+  } else toast(`#seed=${seed}&d=${difficulty}`);
+};
+function syncButtons() {
+  $('b-diff').textContent = `Course: ${difficulty}`;
+}
+
+// ---------- shareable course in the URL: #seed=12&d=hard ----------
+function readHash() {
+  const p = new URLSearchParams(location.hash.slice(1));
+  const n = parseInt(p.get('seed'), 10);
+  seed = Number.isInteger(n) && n > 0 && n < 1e9 ? n : 1;
+  difficulty = DIFFICULTIES.includes(p.get('d')) ? p.get('d') : 'normal';
+  syncButtons();
+}
+function writeHash() {
+  const h = `#seed=${seed}&d=${difficulty}`;
+  if (location.hash !== h) history.replaceState(null, '', h);
+}
+addEventListener('hashchange', () => {
+  const before = `${seed}/${difficulty}`;
+  readHash();
+  if (`${seed}/${difficulty}` !== before) buildWorld();
+});
 $('b-pilot').onclick = () => {
   pilot = pilot === 'racing' ? 'pursuit' : 'racing';
   $('b-pilot').textContent = `Pilot: ${pilot === 'racing' ? 'racing line' : 'pursuit'}`;
@@ -262,6 +299,7 @@ addEventListener('keydown', (e) => {
   if (e.key === 'c') $('b-cam').click();
   if (e.key === 'n') $('b-course').click();
   if (e.key === 'p') $('b-pilot').click();
+  if (e.key === 'd') $('b-diff').click();
 });
 
 // ---------- main loop ----------
@@ -357,6 +395,7 @@ function mulberry(a) {
   };
 }
 
+readHash();
 buildWorld();
 chaseCam.position.set(sim.drone.pos[0], 6, sim.drone.pos[2] - 12);
 requestAnimationFrame(frame);
