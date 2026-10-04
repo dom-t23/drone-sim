@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { makeSim, step, GATE_INNER, v3, DIFFICULTIES, NAV_MODES } from './sim.js';
+import { makeSim, step, GATE_INNER, v3, DIFFICULTIES, NAV_MODES, WIND_MODES, DRONE } from './sim.js';
 
 const DT = 1 / 120;
 const $ = (id) => document.getElementById(id);
@@ -51,7 +51,7 @@ const CAM_MODES = ['chase', 'orbit', 'fpv'];
 
 // ---------- world objects (rebuilt per course) ----------
 let sim, seed = 1, difficulty = 'normal', pilot = 'racing', nav = 'truth', world = new THREE.Group(), racingLine = null;
-let ghosts = [], lineVersion = -1;
+let ghosts = [], lineVersion = -1, windMode = 'off';
 scene.add(world);
 
 const gateMatIdle = new THREE.MeshStandardMaterial({ color: '#d9e2ef', roughness: 0.5, metalness: 0.1 });
@@ -120,7 +120,7 @@ function buildWorld() {
   world = new THREE.Group();
   scene.add(world);
 
-  sim = makeSim({ seed, pilot, difficulty, nav });
+  sim = makeSim({ seed, pilot, difficulty, nav, wind: windMode });
   writeHash();
   gateMeshes = sim.course.gates.map((g) => {
     const m = makeGate(g);
@@ -246,6 +246,34 @@ function pushTrail(p) {
   trailGeo.attributes.position.needsUpdate = true;
 }
 
+// ---------- wind streaks: short dashes drifting with the wind around the drone ----------
+const STREAKS = 160, STREAK_BOX = 36;
+const streakPos = new Float32Array(STREAKS * 6), streakSeed = [];
+const streakGeo = new THREE.BufferGeometry();
+streakGeo.setAttribute('position', new THREE.BufferAttribute(streakPos, 3));
+const streaks = new THREE.LineSegments(streakGeo, new THREE.LineBasicMaterial({ color: '#cfe3ff', transparent: true, opacity: 0.35 }));
+streaks.frustumCulled = false;
+scene.add(streaks);
+for (let i = 0; i < STREAKS; i++) streakSeed.push([Math.random(), Math.random(), Math.random()].map((r) => (r - 0.5) * STREAK_BOX));
+function updateStreaks(dtSim) {
+  streaks.visible = !!sim.wind;
+  if (!sim.wind) return;
+  const w = sim.wind.now, c = sim.drone.pos, half = STREAK_BOX / 2;
+  const len = 0.12; // s of travel each dash shows
+  for (let i = 0; i < STREAKS; i++) {
+    const p = streakSeed[i];
+    for (let k = 0; k < 3; k++) {
+      p[k] += w[k] * dtSim;
+      // keep each dash in a box that travels with the drone
+      const rel = p[k] - c[k];
+      if (rel > half) p[k] -= STREAK_BOX; else if (rel < -half) p[k] += STREAK_BOX;
+    }
+    if (p[1] < 0.2) p[1] += STREAK_BOX / 2;
+    streakPos.set([p[0], p[1], p[2], p[0] - w[0] * len, p[1] - w[1] * len, p[2] - w[2] * len], i * 6);
+  }
+  streakGeo.attributes.position.needsUpdate = true;
+}
+
 // ---------- HUD ----------
 let lastEvents = 0;
 function fmt(t) { return t == null ? '–' : `${t.toFixed(2)} s`; }
@@ -264,6 +292,12 @@ function updateHud(force) {
     const g = sim.course.gates[s.target], b = sim.belief.gates[s.target];
     const mapErr = v3.len(v3.sub(b.mapPos, g.pos)), estErr = v3.len(v3.sub(b.pos, g.pos));
     $('s-vis').textContent = sim.vision ? `${mapErr.toFixed(1)} → ${estErr.toFixed(2)} m` : `${mapErr.toFixed(1)} m out`;
+  }
+  // wind: what is really blowing, and what the drone's observer reckons
+  $('r-wind').hidden = $('s-wind').hidden = !sim.wind;
+  if (sim.wind) {
+    const w = sim.wind.now, est = v3.scale(sim.dist, 1 / DRONE.drag);
+    $('s-wind').textContent = `${Math.hypot(w[0], w[2]).toFixed(0)} m/s · est ${Math.hypot(est[0], est[2]).toFixed(0)}`;
   }
   if (force) return;
   for (; lastEvents < sim.events.length; lastEvents++) {
@@ -326,6 +360,11 @@ $('b-nav').onclick = () => {
   syncButtons();
   buildWorld();
 };
+$('b-wind').onclick = () => {
+  windMode = WIND_MODES[(WIND_MODES.indexOf(windMode) + 1) % WIND_MODES.length];
+  syncButtons();
+  buildWorld();
+};
 $('b-share').onclick = () => {
   const url = location.href;
   if (navigator.clipboard?.writeText) {
@@ -336,6 +375,7 @@ const NAV_LABELS = { truth: 'ground truth', vision: 'vision', blind: 'map only' 
 function syncButtons() {
   $('b-diff').textContent = `Course: ${difficulty}`;
   $('b-nav').textContent = `Nav: ${NAV_LABELS[nav]}`;
+  $('b-wind').textContent = `Wind: ${windMode}`;
 }
 
 // ---------- shareable course in the URL: #seed=12&d=hard&nav=vision ----------
@@ -345,16 +385,18 @@ function readHash() {
   seed = Number.isInteger(n) && n > 0 && n < 1e9 ? n : 1;
   difficulty = DIFFICULTIES.includes(p.get('d')) ? p.get('d') : 'normal';
   nav = NAV_MODES.includes(p.get('nav')) ? p.get('nav') : 'truth';
+  windMode = WIND_MODES.includes(p.get('wind')) ? p.get('wind') : 'off';
   syncButtons();
 }
 function writeHash() {
-  const h = `#seed=${seed}&d=${difficulty}${nav === 'truth' ? '' : `&nav=${nav}`}`;
+  const h = `#seed=${seed}&d=${difficulty}${nav === 'truth' ? '' : `&nav=${nav}`}${windMode === 'off' ? '' : `&wind=${windMode}`}`;
   if (location.hash !== h) history.replaceState(null, '', h);
 }
 addEventListener('hashchange', () => {
-  const before = `${seed}/${difficulty}/${nav}`;
+  const key = () => `${seed}/${difficulty}/${nav}/${windMode}`;
+  const before = key();
   readHash();
-  if (`${seed}/${difficulty}/${nav}` !== before) buildWorld();
+  if (key() !== before) buildWorld();
 });
 $('b-pilot').onclick = () => {
   pilot = pilot === 'racing' ? 'pursuit' : 'racing';
@@ -367,6 +409,7 @@ addEventListener('keydown', (e) => {
   if (e.key === 'p') $('b-pilot').click();
   if (e.key === 'd') $('b-diff').click();
   if (e.key === 'v') $('b-nav').click();
+  if (e.key === 'w') $('b-wind').click();
 });
 
 // ---------- onboard overlay: what the camera detected this frame ----------
@@ -473,6 +516,7 @@ function frame(now) {
   }
 
   syncDrone();
+  updateStreaks(steps * DT);
   propSpin += dtFrame * 60;
   updateCameras(dtFrame);
   updateHud();

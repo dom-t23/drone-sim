@@ -3,13 +3,13 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   makeSim, step, planRacingLine, makeCourse, v3, GATE_INNER, DRONE, G, DIFFICULTIES,
-  cameraPose, project, gateCorners, solveGatePose, CAMERA, optimiseLine, SHAPING,
+  cameraPose, project, gateCorners, solveGatePose, CAMERA, optimiseLine, SHAPING, WIND,
 } from '../src/sim.js';
 
 const SEEDS = [1, 2, 3, 4, 5, 7, 11, 42];
 
-function run(seed, seconds, { dt = 1 / 120, pilot = 'racing', difficulty = 'normal', nav = 'truth', onStep } = {}) {
-  const sim = makeSim({ seed, pilot, difficulty, nav });
+function run(seed, seconds, { dt = 1 / 120, pilot = 'racing', difficulty = 'normal', nav = 'truth', wind = 'off', observer = true, onStep } = {}) {
+  const sim = makeSim({ seed, pilot, difficulty, nav, wind, observer });
   const n = Math.round(seconds / dt);
   for (let i = 0; i < n; i++) {
     step(sim, dt);
@@ -336,4 +336,62 @@ test('vision flights are deterministic, and ground-truth flights carry no vision
   assert.equal(t.vision, null);
   assert.equal(t.launchAt, 0);
   assert.equal(makeSim({ seed: 5, nav: 'bogus' }).nav, 'truth');
+});
+
+// ---------- wind (2026-10-04) ----------
+
+for (const difficulty of DIFFICULTIES) {
+  test(`gusty wind: the racing pilot still flies ${difficulty} courses cleanly`, () => {
+    for (const seed of SEEDS) {
+      let worstGate = 0, target = 0;
+      const sim = run(seed, 50, {
+        difficulty, wind: 'gusty',
+        onStep(sim) {
+          if (sim.state.target === target) return;
+          worstGate = Math.max(worstGate, gateOffset(sim.course.gates[target], sim.drone.pos));
+          target = sim.state.target;
+        },
+      });
+      assert.equal(sim.state.misses, 0, `seed ${seed}: ${sim.state.misses} missed gates`);
+      assert.ok(sim.state.laps.length >= 2, `seed ${seed}: only ${sim.state.laps.length} laps`);
+      assert.ok(worstGate < GATE_INNER / 2 - 0.2, `seed ${seed}: passed ${worstGate.toFixed(2)} m off centre`);
+    }
+  });
+}
+
+test('the disturbance observer measures the wind and cuts the worst tracking errors', () => {
+  let withObs = 0, without = 0;
+  for (const seed of SEEDS) {
+    const worst = (observer) => {
+      let w = 0, est = [0, 0, 0], real = [0, 0, 0], n = 0;
+      run(seed, 50, {
+        wind: 'gusty', observer,
+        onStep(sim) {
+          if (sim.t < 5) return;
+          w = Math.max(w, v3.len(v3.sub(sim.plan.pts[sim.track.idx].p, sim.drone.pos)));
+          est = v3.add(est, v3.scale(sim.dist, 1 / DRONE.drag));
+          real = v3.add(real, sim.wind.now);
+          n++;
+        },
+      });
+      // averaged over the flight, the estimate matches the wind actually flown through
+      const err = v3.len(v3.sub(est, real)) / n;
+      assert.ok(err < 0.5, `seed ${seed}: average wind estimate ${err.toFixed(2)} m/s out`);
+      return w;
+    };
+    withObs += worst(true);
+    without += worst(false);
+  }
+  assert.ok(withObs < without * 0.85, `worst tracking errors: ${withObs.toFixed(2)} m with the observer vs ${without.toFixed(2)} m without`);
+});
+
+test('gusts stay within two sigma of the forecast, and calm runs carry no wind', () => {
+  const sim = makeSim({ seed: 9, wind: 'gusty' });
+  for (let i = 0; i < 120 * 60; i++) {
+    step(sim, 1 / 120);
+    assert.ok(Math.hypot(sim.wind.gust[0], sim.wind.gust[2]) <= 2 * WIND.gusty.gust + 1e-9);
+    assert.ok(Math.abs(sim.wind.gust[1]) <= 2 * WIND.gusty.gust * WIND.vertical + 1e-9);
+  }
+  assert.equal(makeSim({ seed: 9 }).wind, null);
+  assert.equal(makeSim({ seed: 9, wind: 'hurricane' }).wind, null);
 });

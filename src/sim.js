@@ -287,12 +287,12 @@ export function planRacingLine(course, opts = {}) {
 export const SHAPING = { maxOffset: 0.6, rounds: 3, k: [0.6, 1.8], minY: 1.8, coarse: { steps: 80, ds: 0.6 } };
 const shapeCache = new Map();
 // start/rounds/stepScale allow a quick warm-started refinement of an existing shape.
-export function optimiseLine(course, key, { start = null, rounds = SHAPING.rounds, stepScale = 1 } = {}) {
+export function optimiseLine(course, key, { start = null, rounds = SHAPING.rounds, stepScale = 1, plan = {} } = {}) {
   if (key && shapeCache.has(key)) return shapeCache.get(key).map((sh) => ({ ...sh }));
   const n = course.gates.length, S = SHAPING;
   const shape = course.gates.map((_, i) => ({ dr: 0, du: 0, k: 1, ...start?.[i] }));
   const cost = () => {
-    const p = planRacingLine(course, { ...S.coarse, shape });
+    const p = planRacingLine(course, { ...plan, ...S.coarse, shape });
     return p.minY < S.minY ? Infinity : p.lapTime;
   };
   const step = { dr: 0.3 * stepScale, du: 0.3 * stepScale, k: 0.2 * stepScale };
@@ -742,7 +742,7 @@ function visionFrame(sim) {
   V.stats.frames++;
   // after the first lap every gate has been seen: re-shape the line for the real course
   if (sim.shape && !V.reshaped && sim.state.laps.length >= 1) {
-    sim.shape = optimiseLine(sim.belief, null, { start: sim.shape, rounds: 2, stepScale: 0.5 });
+    sim.shape = optimiseLine(sim.belief, null, { start: sim.shape, rounds: 2, stepScale: 0.5, plan: sim.planOpts });
     V.reshaped = true;
     replan(sim);
   }
@@ -755,7 +755,7 @@ function visionFrame(sim) {
 
 function replan(sim) {
   const V = sim.vision, s = sim.plan.pts[sim.track.idx].s;
-  const plan = planRacingLine(sim.belief, { shape: sim.shape });
+  const plan = planRacingLine(sim.belief, { ...sim.planOpts, shape: sim.shape });
   sim.plan = plan;
   sim.track.idx = nearestIndex(plan, sim.drone.pos, Math.round(s / plan.ds) % plan.pts.length, 60, 60);
   sim.planVersion++;
@@ -764,25 +764,72 @@ function replan(sim) {
   V.stats.replans++;
 }
 
+// ---------- wind ----------
+// A steady wind from a random direction plus gusts: each axis is a first-order Gauss-Markov
+// process (vertical gusts weaker), capped at two sigma. Wind acts through drag, on the
+// air-relative velocity.
+export const WIND_MODES = ['off', 'breezy', 'gusty'];
+export const WIND = {
+  breezy: { mean: 6, gust: 2.5 },
+  gusty: { mean: 12, gust: 6 },
+  tau: 1.5, // s, gust correlation time
+  vertical: 0.4, // vertical gusts relative to horizontal
+  observerTau: 0.25, // s, disturbance observer time constant
+};
+
+// Planning for the forecast: keep back the share of the envelope the wind can take
+// (drag at the mean wind plus two gust sigmas), so there is thrust left to fight it.
+export function windMargins(mode) {
+  const W = WIND[mode];
+  if (!W) return {};
+  const reserve = (DRONE.drag * (W.mean + 2 * W.gust)) / DRONE.maxThrustAcc;
+  return { turnMargin: RACING.turnMargin - reserve, comboMargin: RACING.comboMargin - reserve };
+}
+
+function makeWind(mode, seed) {
+  const W = WIND[mode];
+  if (!W) return null;
+  const rand = mulberry32((seed * 15485863 + 101) | 0), dir = rand() * Math.PI * 2;
+  return { mode, rand, mean: [W.mean * Math.cos(dir), 0, W.mean * Math.sin(dir)], gust: [0, 0, 0], sigma: W.gust, now: [W.mean * Math.cos(dir), 0, W.mean * Math.sin(dir)] };
+}
+
+function stepWind(w, dt) {
+  const a = dt / WIND.tau, b = Math.sqrt(2 * a);
+  for (let i = 0; i < 3; i++) {
+    const sd = w.sigma * (i === 1 ? WIND.vertical : 1);
+    w.gust[i] += -a * w.gust[i] + b * sd * gauss(w.rand);
+  }
+  // gusts top out at two sigma, the most the planner keeps in reserve
+  const h = Math.hypot(w.gust[0], w.gust[2]), hMax = 2 * w.sigma, vMax = 2 * w.sigma * WIND.vertical;
+  if (h > hMax) { w.gust[0] *= hMax / h; w.gust[2] *= hMax / h; }
+  w.gust[1] = Math.max(-vMax, Math.min(vMax, w.gust[1]));
+  for (let i = 0; i < 3; i++) w.now[i] = w.mean[i] + w.gust[i];
+}
+
 // ---------- simulation ----------
 export const PILOTS = ['racing', 'pursuit'];
 
 // nav: 'truth' flies from the true gate positions; 'vision' starts from a map with every
 // gate moved and corrects it with the camera; 'blind' trusts the map and nothing else.
-export function makeSim({ seed = 1, gates, pilot = 'racing', difficulty = 'normal', nav = 'truth', optimise = true } = {}) {
+// wind: 'off', 'breezy' or 'gusty'; observer: whether the pilot estimates and cancels it.
+export function makeSim({ seed = 1, gates, pilot = 'racing', difficulty = 'normal', nav = 'truth', optimise = true, wind = 'off', observer = true } = {}) {
   const course = makeCourse({ seed, gates, difficulty });
   if (!NAV_MODES.includes(nav)) nav = 'truth';
   const belief = nav === 'truth' ? null : makeMap(course, seed);
   const drone = makeDrone(course);
   // the racing pilot flies an optimised line; vision keeps its shape through re-plans
-  const shape = pilot === 'racing' && optimise ? optimiseLine(belief ?? course, `${difficulty}/${seed}/${gates}/${nav !== 'truth'}`) : null;
-  const plan = planRacingLine(belief ?? course, { shape });
+  if (!WIND_MODES.includes(wind)) wind = 'off';
+  const planOpts = windMargins(wind);
+  const shape = pilot === 'racing' && optimise
+    ? optimiseLine(belief ?? course, `${difficulty}/${seed}/${gates}/${nav !== 'truth'}/${wind}`, { plan: planOpts })
+    : null;
+  const plan = planRacingLine(belief ?? course, { ...planOpts, shape });
   if (course.difficulty !== 'normal') {
-    // take off from the ground under the racing line, 18 m before the start gate, so the
-    // first gate is a straight climb along the line even when the course curves into it
+    // start hovering on the racing line, 18 m before the start gate, so the launch is a
+    // level run along the line even when the course climbs or curves into the first gate
     const N = plan.pts.length;
     const q = plan.pts[(Math.round((plan.gateS[0] - 18) / plan.ds) + N) % N];
-    drone.pos = [q.p[0], 1.5, q.p[2]];
+    drone.pos = [q.p[0], Math.max(1.5, q.p[1]), q.p[2]];
     drone.yaw = Math.atan2(q.t[0], q.t[2]);
   }
   return {
@@ -801,6 +848,11 @@ export function makeSim({ seed = 1, gates, pilot = 'racing', difficulty = 'norma
     } : null,
     plan,
     shape,
+    planOpts,
+    wind: makeWind(wind, seed), // null when calm
+    // disturbance observer: the unexplained part of the drone's acceleration (m/s^2)
+    dist: [0, 0, 0],
+    observer,
     planVersion: 0,
     launchAt: nav === 'vision' ? VISION.lookFirst : 0, // vision takes a look before it goes
     track: { idx: nearestIndex(plan, drone.pos, 0, 0, plan.pts.length) },
@@ -816,20 +868,33 @@ export function step(sim, dt) {
     sim.t < sim.launchAt ? [0, G, 0] // sitting on the pad
       : sim.pilot === 'pursuit' ? autopilot(drone, sim.belief ?? course, state)
         : racingPilot(sim);
-  const cmd = limitThrust(want);
+  // cancel the disturbance the observer has measured (wind, mostly)
+  const cmd = limitThrust(sim.wind && sim.observer && sim.t >= sim.launchAt ? v3.sub(want, sim.dist) : want);
 
   // first-order lag towards the commanded thrust
   const k = Math.min(1, dt / DRONE.thrustLag);
   drone.thrust = v3.add(drone.thrust, v3.scale(v3.sub(cmd, drone.thrust), k));
 
-  const acc = v3.sub(v3.sub(drone.thrust, [0, G, 0]), v3.scale(drone.vel, DRONE.drag));
-  const prev = drone.pos;
+  const air = sim.wind ? v3.sub(drone.vel, sim.wind.now) : drone.vel; // air-relative velocity
+  const acc = v3.sub(v3.sub(drone.thrust, [0, G, 0]), v3.scale(air, DRONE.drag));
+  const prev = drone.pos, vPrev = drone.vel;
   drone.vel = v3.add(drone.vel, v3.scale(acc, dt));
   drone.pos = v3.add(drone.pos, v3.scale(drone.vel, dt));
 
+  let grounded = false;
   if (drone.pos[1] < 0.15) {
     drone.pos[1] = 0.15;
     if (drone.vel[1] < 0) drone.vel[1] = 0;
+    grounded = true;
+  }
+  if (sim.wind) {
+    // observer: measured acceleration minus what the still-air model predicts, low-passed
+    if (!grounded) {
+      const seen = v3.scale(v3.sub(drone.vel, vPrev), 1 / dt);
+      const model = v3.sub(v3.sub(drone.thrust, [0, G, 0]), v3.scale(vPrev, DRONE.drag));
+      sim.dist = v3.add(sim.dist, v3.scale(v3.sub(v3.sub(seen, model), sim.dist), Math.min(1, dt / WIND.observerTau)));
+    }
+    stepWind(sim.wind, dt);
   }
   const hs = Math.hypot(drone.vel[0], drone.vel[2]);
   if (hs > 0.5) drone.yaw = Math.atan2(drone.vel[0], drone.vel[2]);

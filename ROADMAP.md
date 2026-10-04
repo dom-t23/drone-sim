@@ -9,7 +9,8 @@ A rough backlog, not a contract. Each night picks the item that will make the bi
   - Friction-circle coupling of turn and along-track budgets done (2026-10-04): ~17.3 s on normal.
   - Gate crossing points and tangent lengths optimised by coordinate descent on planned lap time (2026-10-04): ~16.3 s on normal.
   - **Next steps:** minimum-snap or time-optimal (e.g. CPC-style) trajectories instead of Hermite segments; let the planner trade crossing offset against tracking margin per gate; speed up the optimiser (incremental re-planning of the two segments a gate touches) so vision can re-shape continuously. Retighten the lap-time test after each gain.
-- [ ] **Wind and disturbances.** Gusts, sensor noise, motor lag variation; the autopilot must stay robust.
+- [x] **Wind and disturbances.** Steady wind + capped Gauss-Markov gusts, disturbance observer, forecast-aware planning margins (2026-10-04).
+  - **Next steps:** sensor noise and motor lag variation (best done with vision step 2's state estimator); spatially varying wind (gusts that sweep across the course); estimate the wind direction per lap and bias the line to use tailwinds.
 - [ ] **Crashes.** Gate-frame and pillar collisions, with a tumble and respawn.
 
 ## Seeing

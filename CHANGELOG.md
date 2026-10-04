@@ -2,6 +2,14 @@
 
 Newest first. One entry per night's run.
 
+## 2026-10-04 (fourth run): Wind
+- **New Wind button (or `W`)**: off, **breezy** (6 m/s with 2.5 m/s gusts) or **gusty** (12 m/s with 6 m/s gusts), from a random direction per course and saved in the URL (`&wind=gusty`). Streaks drift past the drone so you can see it blowing, and a new **Wind** HUD row shows the real wind next to the drone's own estimate (e.g. `19 m/s · est 19`).
+- The drone measures the wind it's fighting with a **disturbance observer**: it compares the acceleration it actually gets with what its still-air model predicted, low-passes the difference, and cancels it in the next command. Over a flight its average wind estimate matches the real wind to within 0.5 m/s. In gusty wind it cuts the worst tracking errors by about a third; on hard courses, the worst error from the line drops from 1.9 m to 1.1 m.
+- **Planning for the forecast**: when wind is forecast, the racing line keeps back the share of the drone's thrust the wind can take (drag at the mean wind plus two gust sigmas), so there is always thrust left to fight a gust. Gusty laps are about 1.5 s slower, but nothing is missed: zero misses on 60 seeds per difficulty, in gusty wind, with ground truth or vision.
+- Gusts are modelled as correlated random processes (1.5 s correlation time, weaker vertically), capped at two sigma.
+- On easy and hard courses the drone now starts hovering on the racing line 18 m before the start gate, instead of on the ground beneath it. That had meant climbing up to 7 m straight off the pad, which a gust could turn into a miss.
+- Tests: gusty wind on every difficulty with no misses; the observer's estimate is accurate and it cuts worst-case tracking error by at least 15%; gusts stay within their cap; calm runs carry no wind.
+
 ## 2026-10-04 (third run): A shaped racing line
 - **Faster laps everywhere**: the racing line no longer aims at the dead centre of every gate. It now cuts each gate up to 0.6 m off centre, toward the inside of the turn, and chooses how hard to swing into each one. Normal laps drop from about 17.2 s to **16.3 s**, easy from 14.1 s to 13.6 s and hard from 20.8 s to 20.1 s, still with no missed gates on 40 seeds of each difficulty. Watch the line on the course clip the inside of the gates.
 - How: for every gate, three numbers (sideways and vertical crossing offset, and tangent length) are tuned by coordinate descent on the planned lap time, using quick coarse plans with shrinking steps (about 150 ms per course). Lines that dip within 1.8 m of the ground are refused. The start gate keeps its centre line because it's crossed mid-launch.
