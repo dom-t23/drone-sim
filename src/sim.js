@@ -806,13 +806,66 @@ function stepWind(w, dt) {
   for (let i = 0; i < 3; i++) w.now[i] = w.mean[i] + w.gust[i];
 }
 
+// ---------- manual flight ----------
+// An assisted "velocity mode" for a human pilot, the way camera drones fly: the sticks ask
+// for a forward speed, a sideways drift, a climb rate and a turn rate, and the same inner
+// loop as the autopilots (thrust vector with drag and turn feedforward) makes it happen,
+// inside the airframe's limits. Left alone, the climb axis gently holds the height of the
+// next gate (altitude assist) and never lets the drone sink below the floor.
+// stick: { x: turn (+ right), y: forward (+) / back (-), z: climb (+) / descend (-), s: drift (+ right) }, each -1..1.
+export const MANUAL = {
+  vMax: 26, // m/s forward at full stick
+  vBack: 6, // m/s backwards
+  vDrift: 8, // m/s sideways
+  vClimb: 7, // m/s up or down
+  yawRate: 2.4, // rad/s at full stick when slow...
+  aTurn: 13, // ...capped so the turn's sideways acceleration (v * yaw rate) stays flyable
+  kVel: 3.5, // 1/s, velocity tracking gain
+  altAssist: 1.2, // 1/s, pull towards the next gate's height when the climb stick is centred
+  assistMax: 4, // m/s cap on that pull
+  floor: 1.2, // m; the drone refuses to descend below this
+  deadband: 0.06,
+};
+
+const clampStick = (v) => (Math.abs(v) < MANUAL.deadband || !Number.isFinite(v) ? 0 : Math.max(-1, Math.min(1, v)));
+
+// Heading frame of the drone: forward (nose) and right, both horizontal.
+export function headingAxes(yaw) {
+  const c = Math.cos(yaw), s = Math.sin(yaw);
+  return { fwd: [s, 0, c], right: [-c, 0, s] };
+}
+
+export function manualPilot(sim, dt) {
+  const d = sim.drone, M = MANUAL, st = sim.stick ?? {};
+  const sx = clampStick(st.x ?? 0), sy = clampStick(st.y ?? 0), sz = clampStick(st.z ?? 0), ss = clampStick(st.s ?? 0);
+  let { fwd, right } = headingAxes(d.yaw);
+  // turn: yaw rate limited by forward speed so the drone can follow its nose
+  const vf = Math.max(0, v3.dot(d.vel, fwd));
+  const w = -sx * Math.min(M.yawRate, M.aTurn / Math.max(vf, 1)); // + yaw turns left
+  d.yaw += w * dt;
+  ({ fwd, right } = headingAxes(d.yaw));
+  let vc;
+  if (sz) vc = sz * M.vClimb;
+  else if (M.altAssist > 0 && sim.assist !== false) {
+    const gate = (sim.belief ?? sim.course).gates[sim.state.target];
+    vc = Math.max(-M.assistMax, Math.min(M.assistMax, M.altAssist * (gate.pos[1] - d.pos[1])));
+  } else vc = 0;
+  vc = Math.max(vc, 2 * (M.floor - d.pos[1]));
+  const vDes = v3.add(v3.add(v3.scale(fwd, sy >= 0 ? sy * M.vMax : sy * M.vBack), v3.scale(right, ss * M.vDrift)), [0, vc, 0]);
+  // velocity loop + drag feedforward + the turn's centripetal feedforward (w x vDes)
+  let a = v3.scale(v3.sub(vDes, d.vel), M.kVel);
+  a = v3.add(a, v3.scale(vDes, DRONE.drag));
+  a = v3.add(a, [w * vDes[2], 0, -w * vDes[0]]);
+  return v3.add(a, [0, G, 0]);
+}
+
 // ---------- simulation ----------
-export const PILOTS = ['racing', 'pursuit'];
+export const PILOTS = ['racing', 'pursuit', 'manual'];
 
 // nav: 'truth' flies from the true gate positions; 'vision' starts from a map with every
 // gate moved and corrects it with the camera; 'blind' trusts the map and nothing else.
 // wind: 'off', 'breezy' or 'gusty'; observer: whether the pilot estimates and cancels it.
-export function makeSim({ seed = 1, gates, pilot = 'racing', difficulty = 'normal', nav = 'truth', optimise = true, wind = 'off', observer = true } = {}) {
+export function makeSim({ seed = 1, gates, pilot = 'racing', difficulty = 'normal', nav = 'truth', optimise = true, wind = 'off', observer = true, launchAt = null } = {}) {
   const course = makeCourse({ seed, gates, difficulty });
   if (!NAV_MODES.includes(nav)) nav = 'truth';
   const belief = nav === 'truth' ? null : makeMap(course, seed);
@@ -854,7 +907,9 @@ export function makeSim({ seed = 1, gates, pilot = 'racing', difficulty = 'norma
     dist: [0, 0, 0],
     observer,
     planVersion: 0,
-    launchAt: nav === 'vision' ? VISION.lookFirst : 0, // vision takes a look before it goes
+    // vision takes a look before it goes; a race against a human starts on a countdown
+    launchAt: launchAt ?? (nav === 'vision' ? VISION.lookFirst : 0),
+    stick: { x: 0, y: 0, z: 0, s: 0 }, // manual pilot's inputs
     track: { idx: nearestIndex(plan, drone.pos, 0, 0, plan.pts.length) },
     t: 0,
     state: { target: 0, gatesPassed: 0, misses: 0, lap: 0, lapStart: null, laps: [] },
@@ -867,7 +922,8 @@ export function step(sim, dt) {
   const want =
     sim.t < sim.launchAt ? [0, G, 0] // sitting on the pad
       : sim.pilot === 'pursuit' ? autopilot(drone, sim.belief ?? course, state)
-        : racingPilot(sim);
+        : sim.pilot === 'manual' ? manualPilot(sim, dt)
+          : racingPilot(sim);
   // cancel the disturbance the observer has measured (wind, mostly)
   const cmd = limitThrust(sim.wind && sim.observer && sim.t >= sim.launchAt ? v3.sub(want, sim.dist) : want);
 
@@ -897,7 +953,7 @@ export function step(sim, dt) {
     stepWind(sim.wind, dt);
   }
   const hs = Math.hypot(drone.vel[0], drone.vel[2]);
-  if (hs > 0.5) drone.yaw = Math.atan2(drone.vel[0], drone.vel[2]);
+  if (hs > 0.5 && sim.pilot !== 'manual') drone.yaw = Math.atan2(drone.vel[0], drone.vel[2]);
 
   // gate crossing check (segment prev -> pos against the target gate's plane)
   const gate = course.gates[state.target];

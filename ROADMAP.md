@@ -22,7 +22,8 @@ A rough backlog, not a contract. Each night picks the item that will make the bi
 ## Racing
 - [ ] **Ghost replay** of the best lap per course.
 - [ ] **Multiple drones** racing with different controllers or tunings, and a live leaderboard.
-- [ ] **Manual flight**: keyboard, gamepad and touch controls to race against the autopilot ghost.
+- [x] **Manual flight**: keyboard, gamepad and touch sticks in an assisted velocity mode, racing the live racing-line autopilot as a cyan ghost, with countdown, live gap, lap-vs-rival toasts and per-course personal bests (2026-10-05).
+  - **Next steps:** a "rate"/acro mode for experienced pilots (sticks command tilt, no assists); a ghost of *your* best lap (pairs with Ghost replay); a short in-game tutorial lap; haptics on gate pass for phones; an assist slider (altitude assist off, lower top speed for beginners).
 
 ## Showing off
 - [x] **Telemetry panel**: speed (vs plan), tilt and thrust (vs limits), distance off the line, gate splits vs best lap (2026-10-04).

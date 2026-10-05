@@ -59,6 +59,19 @@
     .tm-splits em { font-style: normal; text-align: right; color: var(--muted); }
     .tm-splits .tm-empty { display: block; color: var(--muted); }
     .err { position: fixed; inset: 0; display: none; place-items: center; padding: 24px; text-align: center; color: var(--muted); }
+    .countdown { position: fixed; top: 38%; left: 50%; transform: translate(-50%, -50%); font-size: 84px; font-weight: 800;
+      color: var(--ink); pointer-events: none; text-shadow: 0 4px 24px rgba(0,0,0,.7); font-variant-numeric: tabular-nums; }
+    .countdown.go { color: var(--ok); }
+    .stats b.ahead { color: var(--ok); }
+    .stats b.behind { color: #ff7a7a; }
+    .pads { position: fixed; left: 16px; right: 16px; bottom: 150px; display: flex; justify-content: space-between; pointer-events: none; }
+    .pad { position: relative; width: 124px; height: 124px; border-radius: 50%; background: rgba(11, 18, 32, .45);
+      border: 1px solid var(--line); pointer-events: auto; touch-action: none; user-select: none; -webkit-user-select: none; }
+    .pad .knob { position: absolute; left: 50%; top: 50%; width: 52px; height: 52px; margin: -26px 0 0 -26px; border-radius: 50%;
+      background: rgba(255, 138, 61, .55); border: 1px solid var(--accent); }
+    .pad span { position: absolute; left: 0; right: 0; bottom: -18px; text-align: center; font-size: 10px; letter-spacing: .08em;
+      text-transform: uppercase; color: var(--muted); }
+    @media (max-width: 560px) { .countdown { font-size: 64px; } .pad { width: 110px; height: 110px; } }
     @media (max-width: 560px) { .title small { display: none; } .stats { font-size: 13px; } .note { font-size: 11px; } .tm { width: 200px; } .tm-chart { height: 30px; } }
   </style>
   <script type="importmap">
@@ -83,10 +96,16 @@
       <span>Course</span><b id="s-course">–</b>
       <span id="r-vis" hidden>Vision</span><b id="s-vis" hidden>–</b>
       <span id="r-wind" hidden>Wind</span><b id="s-wind" hidden>–</b>
+      <span id="r-rival" hidden>Rival</span><b id="s-rival" hidden>–</b>
     </div>
   </div>
   <div class="fpv-label" id="fpv-label">Onboard camera</div>
   <div class="toast" id="toast"></div>
+  <div class="countdown" id="countdown" hidden></div>
+  <div class="pads" id="pads" hidden>
+    <div class="pad" id="pad-l" aria-label="Speed and turn stick"><div class="knob"></div><span>speed · turn</span></div>
+    <div class="pad" id="pad-r" aria-label="Climb and drift stick"><div class="knob"></div><span>climb · drift</span></div>
+  </div>
   <div class="controls">
     <button id="b-cam">Camera: chase</button>
     <button id="b-speed">Speed: 1×</button>

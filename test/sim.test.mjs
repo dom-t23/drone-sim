@@ -4,7 +4,9 @@ import assert from 'node:assert/strict';
 import {
   makeSim, step, planRacingLine, makeCourse, v3, GATE_INNER, DRONE, G, DIFFICULTIES,
   cameraPose, project, gateCorners, solveGatePose, CAMERA, optimiseLine, SHAPING, WIND,
+  MANUAL, headingAxes,
 } from '../src/sim.js';
+import { makeRace, syncRace, raceGap } from '../src/race.js';
 import { makeSplits, splitsOnEvent } from '../src/splits.js';
 
 const SEEDS = [1, 2, 3, 4, 5, 7, 11, 42];
@@ -421,4 +423,125 @@ test('splits from a real flight: one row per gate, deltas once a lap is done', (
   assert.equal(S.rows.length, gates - 1, 'every gate after the first start line gives a row');
   assert.ok(Math.abs(S.bestLap - Math.min(...sim.state.laps)) < 1e-9);
   assert.ok(S.rows.slice(10).every((r) => r.delta !== null));
+});
+
+// ---------- manual flight ----------
+// A stand-in for a human: looks at the next gate, turns towards a point on its axis and
+// eases off the throttle while the nose is off target. It only touches the sticks.
+function botSticks(sim, cruise = 0.5) {
+  const d = sim.drone, gate = sim.course.gates[sim.state.target];
+  const rel = v3.sub(d.pos, gate.pos), along = v3.dot(rel, gate.normal);
+  const lat = v3.len(v3.sub(rel, v3.scale(gate.normal, along)));
+  const aim = along > 1 || (along > -1 && lat > GATE_INNER / 2)
+    ? v3.sub(gate.pos, v3.scale(gate.normal, 10))
+    : v3.add(gate.pos, v3.scale(gate.normal, Math.min(along + 7, 6)));
+  let err = Math.atan2(aim[0] - d.pos[0], aim[2] - d.pos[2]) - d.yaw;
+  err = Math.atan2(Math.sin(err), Math.cos(err));
+  return { x: Math.max(-1, Math.min(1, -2.5 * err)), y: cruise * Math.max(0.15, 1 - 1.2 * Math.abs(err)), z: 0, s: 0 };
+}
+const tiltDeg = (sim) => (Math.acos(v3.norm(sim.drone.thrust)[1]) * 180) / Math.PI;
+
+test('manual: centred sticks hover in place, and altitude assist climbs to the next gate', () => {
+  const sim = makeSim({ seed: 3, pilot: 'manual' });
+  sim.assist = false;
+  const start = sim.drone.pos.slice();
+  for (let i = 0; i < 6 * 120; i++) step(sim, 1 / 120);
+  assert.ok(v3.len(v3.sub(sim.drone.pos, start)) < 0.3, `drifted ${v3.len(v3.sub(sim.drone.pos, start)).toFixed(2)} m`);
+  sim.assist = true;
+  for (let i = 0; i < 8 * 120; i++) step(sim, 1 / 120);
+  const gy = sim.course.gates[0].pos[1];
+  assert.ok(Math.abs(sim.drone.pos[1] - gy) < 0.5, `at ${sim.drone.pos[1].toFixed(2)} m, gate at ${gy.toFixed(2)} m`);
+  assert.ok(Math.hypot(sim.drone.pos[0] - start[0], sim.drone.pos[2] - start[2]) < 0.3, 'wandered sideways while climbing');
+});
+
+test('manual: full stick reaches top speed along the nose, and turns follow the nose within the envelope', () => {
+  const sim = makeSim({ seed: 3, pilot: 'manual' });
+  sim.stick = { x: 0, y: 1, z: 0, s: 0 };
+  for (let i = 0; i < 10 * 120; i++) step(sim, 1 / 120);
+  const { fwd } = headingAxes(sim.drone.yaw);
+  const speed = v3.len(sim.drone.vel);
+  assert.ok(Math.abs(speed - MANUAL.vMax) < 1, `speed ${speed.toFixed(1)} m/s`);
+  assert.ok(v3.dot(v3.norm(sim.drone.vel), fwd) > 0.99, 'not flying along the nose');
+  const yaw0 = sim.drone.yaw;
+  sim.stick = { x: 1, y: 1, z: 0, s: 0 };
+  let worstSlip = 0, worstTilt = 0;
+  for (let i = 0; i < 6 * 120; i++) {
+    step(sim, 1 / 120);
+    worstTilt = Math.max(worstTilt, tiltDeg(sim));
+    if (i > 120) {
+      const f = headingAxes(sim.drone.yaw).fwd, v = v3.norm([sim.drone.vel[0], 0, sim.drone.vel[2]]);
+      worstSlip = Math.max(worstSlip, (Math.acos(Math.min(1, v3.dot(f, v))) * 180) / Math.PI);
+    }
+  }
+  assert.ok(sim.drone.yaw < yaw0 - 2, 'full right stick should turn right (yaw decreasing)');
+  assert.ok(worstTilt <= (DRONE.maxTiltRad * 180) / Math.PI + 1e-6, `tilt ${worstTilt.toFixed(1)}°`);
+  assert.ok(worstSlip < 12, `velocity lags the nose by ${worstSlip.toFixed(1)}°`);
+});
+
+test('manual: full descend stops at the floor, and nothing moves before the start countdown ends', () => {
+  const sim = makeSim({ seed: 1, pilot: 'manual', launchAt: 3 });
+  const start = sim.drone.pos.slice();
+  sim.stick = { x: 1, y: 1, z: 1, s: 1 };
+  for (let i = 0; i < 2.9 * 120; i++) step(sim, 1 / 120);
+  assert.ok(v3.len(v3.sub(sim.drone.pos, start)) < 1e-9, 'moved before the countdown ended');
+  sim.stick = { x: 0, y: 0.3, z: -1, s: 0 };
+  let lowest = Infinity;
+  for (let i = 0; i < 8 * 120; i++) {
+    step(sim, 1 / 120);
+    lowest = Math.min(lowest, sim.drone.pos[1]);
+  }
+  assert.ok(lowest > MANUAL.floor - 0.25, `sank to ${lowest.toFixed(2)} m`);
+});
+
+for (const difficulty of ['easy', 'normal']) {
+  test(`manual: a stick-only pilot can fly ${difficulty} courses without missing gates`, () => {
+    for (const seed of SEEDS) {
+      const sim = makeSim({ seed, pilot: 'manual', difficulty, optimise: false });
+      for (let i = 0; i < 100 * 120; i++) {
+        sim.stick = botSticks(sim);
+        step(sim, 1 / 120);
+        assert.ok(tiltDeg(sim) <= (DRONE.maxTiltRad * 180) / Math.PI + 1e-6);
+      }
+      assert.ok(sim.state.laps.length >= 2, `seed ${seed}: only ${sim.state.laps.length} laps`);
+      assert.equal(sim.state.misses, 0, `seed ${seed}: ${sim.state.misses} missed gates`);
+    }
+  });
+}
+
+test('race: gap at the last gate both passed, and who is leading', () => {
+  const ev = (ts) => ({ events: ts.map((t, i) => ({ t, type: i === 1 ? 'lap' : 'gate' })) });
+  const race = makeRace();
+  assert.equal(raceGap(race).gap, null);
+  syncRace(race, ev([1, 0, 3]), ev([0.5]));
+  // you: gates at 1 and 3 (the 'lap' event is skipped); rival: gate at 0.5
+  assert.deepEqual(race.you, [1, 3]);
+  let g = raceGap(race);
+  assert.equal(g.gap, 0.5);
+  assert.equal(g.leading, true);
+  const r2 = makeRace();
+  syncRace(r2, ev([2]), ev([1, 9, 2.5]));
+  g = raceGap(r2);
+  assert.equal(g.gap, 1);
+  assert.equal(g.leading, false);
+  // syncing again adds nothing new
+  syncRace(r2, ev([2]), ev([1, 9, 2.5]));
+  assert.deepEqual(r2.rival, [1, 2.5]);
+});
+
+test('race: a cautious stick pilot trails the racing-line rival, which keeps lapping cleanly', () => {
+  const you = makeSim({ seed: 2, pilot: 'manual', launchAt: 3, optimise: false });
+  const rival = makeSim({ seed: 2, pilot: 'racing', launchAt: 3 });
+  const race = makeRace();
+  for (let i = 0; i < 60 * 120; i++) {
+    you.stick = botSticks(you);
+    step(you, 1 / 120);
+    step(rival, 1 / 120);
+    syncRace(race, you, rival);
+  }
+  const g = raceGap(race);
+  assert.equal(g.leading, false);
+  assert.ok(g.gap > 5, `gap ${g.gap?.toFixed(2)} s`);
+  assert.ok(rival.state.laps.length >= 2 && rival.state.misses === 0);
+  // the countdown delays the rival's first gate by the launch time, nothing more
+  assert.ok(race.rival[0] > 3);
 });

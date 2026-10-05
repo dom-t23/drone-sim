@@ -1,5 +1,6 @@
 import * as THREE from 'three';
-import { makeSim, step, GATE_INNER, v3, DIFFICULTIES, NAV_MODES, WIND_MODES, DRONE } from './sim.js';
+import { makeSim, step, GATE_INNER, v3, DIFFICULTIES, NAV_MODES, WIND_MODES, PILOTS, DRONE } from './sim.js';
+import { makeRace, syncRace, raceGap } from './race.js';
 import { makeTelemetry, resetTelemetry, sampleTelemetry, drawTelemetry } from './telemetry.js';
 
 const DT = 1 / 120;
@@ -53,6 +54,9 @@ const CAM_MODES = ['chase', 'orbit', 'fpv'];
 // ---------- world objects (rebuilt per course) ----------
 let sim, seed = 1, difficulty = 'normal', pilot = 'racing', nav = 'truth', world = new THREE.Group(), racingLine = null;
 let ghosts = [], lineVersion = -1, windMode = 'off';
+// manual flight: you fly `sim`, the racing-line autopilot flies `rival` on the same course
+let rival = null, race = null, pb = null;
+const COUNTDOWN = 3; // s on the pad before a race starts
 const telemetry = makeTelemetry($('telemetry'));
 scene.add(world);
 
@@ -122,7 +126,15 @@ function buildWorld() {
   world = new THREE.Group();
   scene.add(world);
 
-  sim = makeSim({ seed, pilot, difficulty, nav, wind: windMode });
+  const manual = pilot === 'manual';
+  // you fly by eye, so your sim knows the true course; the rival uses the chosen nav mode
+  sim = makeSim({ seed, pilot, difficulty, nav: manual ? 'truth' : nav, wind: windMode, launchAt: manual ? COUNTDOWN : null, optimise: !manual });
+  rival = manual ? makeSim({ seed, pilot: 'racing', difficulty, nav, wind: windMode, launchAt: COUNTDOWN }) : null;
+  race = manual ? makeRace() : null;
+  pb = manual ? loadPb() : null;
+  rivalMesh.visible = manual;
+  $('countdown').hidden = true;
+  $('pads').hidden = !(manual && coarse);
   writeHash();
   gateMeshes = sim.course.gates.map((g) => {
     const m = makeGate(g);
@@ -174,7 +186,8 @@ function drawRacingLine() {
     world.remove(racingLine);
     racingLine.geometry.dispose();
   }
-  const plan = sim.plan;
+  const src = rival ?? sim; // in a race, show the rival's line as a guide
+  const plan = src.plan;
   const linePos = new Float32Array(plan.pts.length * 3);
   const lineCol = new Float32Array(plan.pts.length * 3);
   const vLo = Math.min(...plan.pts.map((q) => q.v)), vHi = Math.max(...plan.pts.map((q) => q.v));
@@ -188,9 +201,9 @@ function drawRacingLine() {
   lineGeo.setAttribute('position', new THREE.BufferAttribute(linePos, 3));
   lineGeo.setAttribute('color', new THREE.BufferAttribute(lineCol, 3));
   racingLine = new THREE.LineLoop(lineGeo, lineMat);
-  racingLine.visible = pilot === 'racing';
+  racingLine.visible = pilot !== 'pursuit';
   world.add(racingLine);
-  lineVersion = sim.planVersion;
+  lineVersion = src.planVersion;
 }
 
 // ---------- drone model ----------
@@ -225,6 +238,15 @@ const drone = new THREE.Group();
   drone.scale.setScalar(2.2); // a little larger than life so it reads on screen
 }
 scene.add(drone);
+
+// the rival in a race: a translucent cyan copy of the drone, flown by the autopilot
+const ghostDroneMat = new THREE.MeshBasicMaterial({ color: '#4dd2ff', transparent: true, opacity: 0.5, depthWrite: false });
+const rivalMesh = drone.clone(true);
+rivalMesh.traverse((o) => {
+  if (o.isMesh) { o.material = ghostDroneMat; o.castShadow = false; }
+});
+rivalMesh.visible = false;
+scene.add(rivalMesh);
 
 // onboard camera mounted on the nose, tilted up like a real FPV cam
 const camMount = new THREE.Object3D();
@@ -287,7 +309,21 @@ function updateHud(force) {
   $('s-best').textContent = fmt(s.laps.length ? Math.min(...s.laps) : null);
   $('s-speed').textContent = `${(v3.len(sim.drone.vel) * 3.6).toFixed(0)} km/h`;
   $('s-gates').textContent = s.misses ? `${s.gatesPassed} · ${s.misses} missed` : s.gatesPassed;
-  $('s-plan').textContent = pilot === 'racing' ? fmt(sim.plan.lapTime) : '–';
+  $('s-plan').textContent = pilot === 'racing' ? fmt(sim.plan.lapTime) : rival ? fmt(rival.plan.lapTime) : '–';
+  // race: gap to the rival at the last gate you've both passed (+ behind, − ahead)
+  $('r-rival').hidden = $('s-rival').hidden = !race;
+  if (race) {
+    const { gap, you, rival: theirs } = raceGap(race), el = $('s-rival');
+    if (gap != null) {
+      el.textContent = `${gap >= 0 ? '+' : '−'}${Math.abs(gap).toFixed(2)} s`;
+      el.className = gap > 0 ? 'behind' : 'ahead';
+    } else {
+      // you haven't made the first gate yet: count how many the rival is up
+      const up = theirs - you;
+      el.textContent = up > 0 ? `+${up} gate${up === 1 ? '' : 's'}` : '–';
+      el.className = up > 0 ? 'behind' : '';
+    }
+  }
   $('s-course').textContent = `#${seed} ${difficulty}`;
   // vision: how far out the map is for the next gate, and how far out the estimate is now
   $('r-vis').hidden = $('s-vis').hidden = !sim.belief;
@@ -305,7 +341,7 @@ function updateHud(force) {
   if (force) return;
   for (; lastEvents < sim.events.length; lastEvents++) {
     const e = sim.events[lastEvents];
-    if (e.type === 'lap') toast(`Lap ${fmt(e.time)}`);
+    if (e.type === 'lap') toast(race ? lapToast(e.time) : `Lap ${fmt(e.time)}`);
     if (e.type === 'gate') onGate(e.gate);
     if (e.type === 'miss') toast(`Missed gate ${e.gate + 1}`, true);
   }
@@ -316,6 +352,29 @@ function onGate(id) {
   setGateMat((id + 1) % n, gateMatNext);
   if (id === n - 1) for (let i = 1; i < n - 1; i++) setGateMat(i, gateMatIdle);
   if (id === 0) setGateMat(n - 1, gateMatIdle);
+}
+// Your lap in a race: against the rival's best, and your personal best on this course.
+function lapToast(t) {
+  const rb = rival.state.laps.length ? Math.min(...rival.state.laps) : null;
+  const vs = rb == null ? '' : ` · rival ${rb.toFixed(2)}`;
+  if (pb == null || t < pb) {
+    const first = pb == null;
+    pb = t;
+    savePb(t);
+    return first ? `Lap ${fmt(t)}${vs}` : `New best ${fmt(t)}${vs}`;
+  }
+  return `Lap ${fmt(t)}${vs}`;
+}
+// personal bests per course, kept in this browser only
+const pbKey = () => `drone-sim:pb:${seed}:${difficulty}:${windMode}`;
+function loadPb() {
+  try {
+    const v = parseFloat(localStorage.getItem(pbKey()));
+    return Number.isFinite(v) ? v : null;
+  } catch { return null; }
+}
+function savePb(t) {
+  try { localStorage.setItem(pbKey(), String(t)); } catch { /* storage unavailable */ }
 }
 let toastTimer;
 function toast(msg, bad = false) {
@@ -332,11 +391,16 @@ const NAV_NOTES = {
   vision: '<b>Vision.</b> The drone\'s map has every gate up to 2.6 m out. Its camera finds the real gates (corner boxes in the onboard view) and it re-plans through its estimates (cyan).',
   blind: '<b>Map only.</b> The drone trusts a map with every gate up to 2.6 m out (cyan), so it misses gates.',
 };
+const coarse = matchMedia('(pointer: coarse)').matches;
+const MANUAL_NOTE = coarse
+  ? '<b>You fly.</b> Left stick: speed and turn. Right stick: climb and drift (height is held for you). Beat the cyan ghost: it\'s the autopilot.'
+  : '<b>You fly.</b> <b>W</b>/<b>↑</b> speed, <b>A D</b>/<b>← →</b> turn, <b>Space</b>/<b>Shift</b> climb (height is held for you). Gamepads work too. Beat the cyan ghost: it\'s the autopilot.';
 let noteTimer;
 function showNavNote() {
   const el = $('nav-note');
-  el.innerHTML = NAV_NOTES[nav] ?? '';
-  el.hidden = !NAV_NOTES[nav];
+  const html = pilot === 'manual' ? MANUAL_NOTE : NAV_NOTES[nav];
+  el.innerHTML = html ?? '';
+  el.hidden = !html;
   el.classList.remove('fade');
   clearTimeout(noteTimer);
   noteTimer = setTimeout(() => el.classList.add('fade'), 12000);
@@ -385,7 +449,9 @@ function syncButtons() {
   $('b-diff').textContent = `Course: ${difficulty}`;
   $('b-nav').textContent = `Nav: ${NAV_LABELS[nav]}`;
   $('b-wind').textContent = `Wind: ${windMode}`;
+  $('b-pilot').textContent = `Pilot: ${PILOT_LABELS[pilot]}`;
 }
+const PILOT_LABELS = { racing: 'racing line', pursuit: 'pursuit', manual: 'you' };
 
 // ---------- shareable course in the URL: #seed=12&d=hard&nav=vision ----------
 function readHash() {
@@ -395,24 +461,91 @@ function readHash() {
   difficulty = DIFFICULTIES.includes(p.get('d')) ? p.get('d') : 'normal';
   nav = NAV_MODES.includes(p.get('nav')) ? p.get('nav') : 'truth';
   windMode = WIND_MODES.includes(p.get('wind')) ? p.get('wind') : 'off';
+  pilot = PILOTS.includes(p.get('pilot')) ? p.get('pilot') : 'racing';
   syncButtons();
 }
 function writeHash() {
-  const h = `#seed=${seed}&d=${difficulty}${nav === 'truth' ? '' : `&nav=${nav}`}${windMode === 'off' ? '' : `&wind=${windMode}`}`;
+  const h = `#seed=${seed}&d=${difficulty}${nav === 'truth' ? '' : `&nav=${nav}`}${windMode === 'off' ? '' : `&wind=${windMode}`}${pilot === 'racing' ? '' : `&pilot=${pilot}`}`;
   if (location.hash !== h) history.replaceState(null, '', h);
 }
 addEventListener('hashchange', () => {
-  const key = () => `${seed}/${difficulty}/${nav}/${windMode}`;
+  const key = () => `${seed}/${difficulty}/${nav}/${windMode}/${pilot}`;
   const before = key();
   readHash();
   if (key() !== before) buildWorld();
 });
 $('b-pilot').onclick = () => {
-  pilot = pilot === 'racing' ? 'pursuit' : 'racing';
-  $('b-pilot').textContent = `Pilot: ${pilot === 'racing' ? 'racing line' : 'pursuit'}`;
+  pilot = PILOTS[(PILOTS.indexOf(pilot) + 1) % PILOTS.length];
+  syncButtons();
   buildWorld();
 };
+
+// ---------- manual flight inputs: keyboard, gamepad and touch sticks ----------
+const FLIGHT_KEYS = new Set(['w', 'a', 's', 'd', 'q', 'e', ' ', 'shift', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright']);
+const keys = new Set();
+const kb = { x: 0, y: 0, z: 0 }; // keyboard sticks, eased so a tap isn't a jolt
+const keyName = (e) => e.key.toLowerCase();
+addEventListener('keyup', (e) => {
+  if (!FLIGHT_KEYS.has(keyName(e))) return;
+  keys.delete(keyName(e));
+  if (pilot === 'manual') e.preventDefault(); // stops Space "clicking" a focused button
+});
+addEventListener('blur', () => keys.clear());
+
+function makePad(el) {
+  const st = { x: 0, y: 0, id: null }, knob = el.querySelector('.knob');
+  const move = (e) => {
+    const r = el.getBoundingClientRect(), R = r.width / 2;
+    let dx = (e.clientX - r.left - R) / R, dy = (e.clientY - r.top - R) / R;
+    const l = Math.hypot(dx, dy);
+    if (l > 1) { dx /= l; dy /= l; }
+    st.x = dx; st.y = dy;
+    knob.style.transform = `translate(${dx * R * 0.6}px, ${dy * R * 0.6}px)`;
+  };
+  el.addEventListener('pointerdown', (e) => {
+    st.id = e.pointerId;
+    el.setPointerCapture(e.pointerId);
+    move(e);
+    e.preventDefault();
+  });
+  el.addEventListener('pointermove', (e) => { if (e.pointerId === st.id) move(e); });
+  const end = (e) => {
+    if (e.pointerId !== st.id) return;
+    st.id = null; st.x = st.y = 0;
+    knob.style.transform = '';
+  };
+  el.addEventListener('pointerup', end);
+  el.addEventListener('pointercancel', end);
+  return st;
+}
+const padL = makePad($('pad-l')), padR = makePad($('pad-r'));
+
+function readSticks(dt) {
+  const on = (a, b) => (keys.has(a) || keys.has(b) ? 1 : 0);
+  const want = {
+    x: on('d', 'arrowright') - on('a', 'arrowleft'),
+    y: on('w', 'arrowup') - on('s', 'arrowdown'),
+    z: on(' ', 'e') - on('shift', 'q'),
+  };
+  const r = Math.min(1, dt * 6);
+  for (const a in want) kb[a] += (want[a] - kb[a]) * r;
+  // left stick (pad or gamepad): speed and turn; right stick: climb and drift
+  const st = { x: kb.x + padL.x, y: kb.y - padL.y, z: kb.z - padR.y, s: padR.x };
+  const gp = [...(navigator.getGamepads?.() ?? [])].find((g) => g && g.connected);
+  if (gp) {
+    const ax = (i) => (Math.abs(gp.axes[i] ?? 0) > 0.12 ? gp.axes[i] : 0);
+    st.x += ax(0); st.y -= ax(1); st.s += ax(2); st.z -= ax(3);
+  }
+  for (const a in st) st[a] = Math.max(-1, Math.min(1, st[a]));
+  return st;
+}
+
 addEventListener('keydown', (e) => {
+  if (pilot === 'manual' && FLIGHT_KEYS.has(keyName(e))) {
+    keys.add(keyName(e));
+    e.preventDefault();
+    return;
+  }
   if (e.key === 'c') $('b-cam').click();
   if (e.key === 'n') $('b-course').click();
   if (e.key === 'p') $('b-pilot').click();
@@ -486,13 +619,23 @@ let acc = 0, last = performance.now(), propSpin = 0, frameNo = 0;
 const controls = document.querySelector('.controls');
 let controlsTop = controls.getBoundingClientRect().top;
 
-function syncDrone() {
-  const d = sim.drone;
-  drone.position.set(...d.pos);
+function syncMesh(mesh, d) {
+  mesh.position.set(...d.pos);
   yawQ.setFromAxisAngle(UP, d.yaw);
   tmpV.set(...v3.norm(d.thrust));
   tmpQ.setFromUnitVectors(UP, tmpV);
-  drone.quaternion.copy(tmpQ).multiply(yawQ);
+  mesh.quaternion.copy(tmpQ).multiply(yawQ);
+}
+function syncDrone() { syncMesh(drone, sim.drone); }
+
+// 3, 2, 1, GO! while both racers sit on the pad
+function updateCountdown() {
+  const el = $('countdown'), left = sim.launchAt - sim.t;
+  el.hidden = left < -0.8;
+  if (el.hidden) return;
+  const txt = left > 0 ? String(Math.ceil(left)) : 'GO!';
+  if (el.textContent !== txt) el.textContent = txt;
+  el.classList.toggle('go', left <= 0);
 }
 
 function updateCameras(dtFrame) {
@@ -518,24 +661,35 @@ function frame(now) {
   const dtFrame = Math.min(0.1, (now - last) / 1000);
   last = now;
   acc += dtFrame * timeScale;
+  if (pilot === 'manual') sim.stick = readSticks(dtFrame);
   let steps = 0;
   while (acc >= DT && steps < 1200) {
     step(sim, DT);
+    if (rival) step(rival, DT);
     sampleTelemetry(telemetry, sim);
     acc -= DT;
     if (++steps % 6 === 0) pushTrail(sim.drone.pos);
   }
 
   syncDrone();
+  if (rival) {
+    syncRace(race, sim, rival);
+    syncMesh(rivalMesh, rival.drone);
+    updateCountdown();
+  }
   updateStreaks(steps * DT);
   propSpin += dtFrame * 60;
   updateCameras(dtFrame);
   updateHud();
-  if (sim.planVersion !== lineVersion) drawRacingLine();
+  if ((rival ?? sim).planVersion !== lineVersion) drawRacingLine();
   if (!$('telemetry').hidden && frameNo % 2 === 0) drawTelemetry(telemetry, sim);
   ghosts.forEach((g, i) => g.position.set(...sim.belief.gates[i].pos));
 
   const W = innerWidth, H = innerHeight;
+  // touch sticks sit just above the buttons; the onboard view goes above them
+  if (frameNo % 30 === 0) controlsTop = controls.getBoundingClientRect().top;
+  const padsOn = !$('pads').hidden, padsBottom = H - controlsTop + 26;
+  if (padsOn) $('pads').style.bottom = `${padsBottom}px`;
   renderer.setScissorTest(false);
   renderer.setViewport(0, 0, W, H);
   if (camMode === 'fpv') {
@@ -551,7 +705,7 @@ function frame(now) {
     // picture-in-picture onboard view, kept clear of the control buttons
     if (frameNo % 30 === 0) controlsTop = controls.getBoundingClientRect().top;
     const w = Math.round(Math.min(Math.max(W * 0.3, 160), 360)), h = Math.round(w * 9 / 16);
-    const x = W - w - 14, y = Math.max(78, H * 0.12, H - controlsTop + 10);
+    const x = W - w - 14, y = Math.max(78, H * 0.12, padsOn ? padsBottom + $('pad-r').offsetHeight + 10 : H - controlsTop + 10);
     fpvCam.aspect = w / h;
     fpvCam.updateProjectionMatrix();
     renderer.setScissorTest(true);
