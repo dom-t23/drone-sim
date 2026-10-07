@@ -21,10 +21,11 @@ A rough backlog, not a contract. Each night picks the item that will make the bi
 - [ ] **Vision mode, step 3.** Detect the gate from the actual rendered pixels (colour segmentation and corner finding on a downscaled onboard frame).
 
 ## Racing
-- [ ] **Ghost replay** of the best lap per course.
+- [x] **Ghost replay** of the best lap: a gold ghost flies the best lap so far in step with the current lap, with a live gap at each gate; yours are saved per course in the browser (2026-10-07).
+  - **Next steps:** a faint gold trail behind the ghost; share a ghost in the URL (or a short code) so a friend can race your lap; let the cyan rival and the gold ghost trade places on a toggle; a "clear my ghost" button.
 - [ ] **Multiple drones** racing with different controllers or tunings, and a live leaderboard.
 - [x] **Manual flight**: keyboard, gamepad and touch sticks in an assisted velocity mode, racing the live racing-line autopilot as a cyan ghost, with countdown, live gap, lap-vs-rival toasts and per-course personal bests (2026-10-05).
-  - **Next steps:** a "rate"/acro mode for experienced pilots (sticks command tilt, no assists); a ghost of *your* best lap (pairs with Ghost replay); a short in-game tutorial lap; haptics on gate pass for phones; an assist slider (altitude assist off, lower top speed for beginners).
+  - **Next steps:** a "rate"/acro mode for experienced pilots (sticks command tilt, no assists); ~~a ghost of *your* best lap~~ (done with Ghost replay, 2026-10-07); a short in-game tutorial lap; haptics on gate pass for phones; an assist slider (altitude assist off, lower top speed for beginners).
 
 ## Showing off
 - [x] **Telemetry panel**: speed (vs plan), tilt and thrust (vs limits), distance off the line, gate splits vs best lap (2026-10-04).

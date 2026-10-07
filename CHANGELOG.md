@@ -2,6 +2,14 @@
 
 Newest first. One entry per night's run.
 
+## 2026-10-07 (second run): Ghost replay
+- **A gold ghost flies your best lap.** Every lap is recorded, and from the second lap on a translucent gold drone replays the fastest one so far, in step with the lap you're on. It's easiest to see with **Pilot: you** (it's your own best lap, so you can chase it) or with **Nav: vision** and **Wind: gusty**, where laps differ. When the autopilot repeats a lap exactly, the ghost sits inside the drone and is hidden.
+- A new **Ghost** row in the stats shows the gap to the ghost at the last gate you passed: green `−0.31 s` when you're ahead, red `+0.42 s` when you're behind. Until there's a gate to compare, it shows the ghost's lap time.
+- **Your ghost is kept.** In Pilot: you, your best lap's ghost is saved in this browser for each course, difficulty and wind, so next time it's waiting on the start line. Race the cyan autopilot and your own gold best at the same time.
+- New **Ghost** button (or `G`) to hide or show it.
+- How it works: `src/ghost.js` samples position, heading, tilt and any crash tumble 20 times a second from the moment the lap starts, plus the time at each gate. The replay interpolates between samples (the shortest way round for heading), so it stays within a few centimetres of the real flight. Saved ghosts are stored as whole centimetres and milliradians, about 15 KB a lap.
+- Tests: the ghost of a real autopilot flight is the fastest lap, has one split per gate, and replays within 8 cm of where the drone actually flew; only a faster lap replaces it, and the gap is right at gates and at the line; saved ghosts load back to within 2 cm, junk is rejected, and crash tumbles replay.
+
 ## 2026-10-07: Crashes
 - **Gates and pillars are solid now.** Clip a gate frame, a support leg or one of the scenery pillars and the drone cuts out: it bounces off, tumbles to the ground in a shower of sparks, and a red toast says what you hit (`Crashed into gate 4`). After about a second and a half it **respawns on the racing line just past the last gate you passed**, hovers for half a second and is yours again. A crash costs time, never progress, and you can't crash your way to a shortcut. The **Gates** row counts crashes (`7 · 2 crashed`).
 - Try it with **Pilot: you**: the bottom bar of a low gate is easy to catch if you hold descend. Light touches (under 1.5 m/s into the surface) don't count: the drone just slides along the frame.

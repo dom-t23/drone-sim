@@ -8,6 +8,7 @@ import {
 } from '../src/sim.js';
 import { makeRace, syncRace, raceGap } from '../src/race.js';
 import { makeSplits, splitsOnEvent } from '../src/splits.js';
+import { GHOST, makeGhostRecorder, recordGhost, ghostPose, ghostGap, encodeGhost, decodeGhost } from '../src/ghost.js';
 
 const SEEDS = [1, 2, 3, 4, 5, 7, 11, 42];
 
@@ -699,4 +700,106 @@ test('crashes: map-only flies through frames, and crash flights are deterministi
   const a = fly(), b = fly();
   assert.equal(a.state.crashes, 1);
   assert.deepEqual(a.drone.pos, b.drone.pos);
+});
+
+// ---------- ghost replay (2026-10-07) ----------
+
+test('ghost: records the best lap, and replays it where the drone really flew', () => {
+  const sim = makeSim({ seed: 3 });
+  const rec = makeGhostRecorder();
+  const truth = []; // [t into lap, pos] for the lap being flown
+  let lapTruth = null, start = null;
+  for (let i = 0; i < 60 * 120; i++) {
+    step(sim, 1 / 120);
+    const kept = recordGhost(rec, sim);
+    if (kept) lapTruth = truth.slice();
+    if (sim.state.lapStart !== start) { start = sim.state.lapStart; truth.length = 0; }
+    if (start != null && i % 7 === 3) truth.push([sim.t - start, sim.drone.pos.slice()]);
+  }
+  const { laps } = sim.state, g = rec.best;
+  assert.ok(laps.length >= 2 && g, 'no ghost after two laps');
+  assert.equal(g.time, Math.min(...laps));
+  assert.ok(Math.abs(g.frames.length / 11 - g.time * GHOST.rate) <= 2, `${g.frames.length / 11} frames for ${g.time.toFixed(2)} s`);
+  // gate splits: one per gate, in order, gate 0 closing the lap
+  const n = sim.course.gates.length;
+  for (let k = 2; k < n; k++) assert.ok(g.gates[k] > g.gates[k - 1]);
+  assert.equal(g.gates[0], g.time);
+  // between samples the replay stays within a few centimetres of the real flight
+  assert.ok(lapTruth.length > 100);
+  let worst = 0;
+  for (const [t, p] of lapTruth) {
+    const q = ghostPose(g, t);
+    if (!q) continue;
+    worst = Math.max(worst, v3.len(v3.sub(q.pos, p)));
+    assert.ok(Math.abs(v3.len(q.thrust) - 1) < 0.02);
+  }
+  assert.ok(worst < 0.08, `replay off by ${worst.toFixed(3)} m`);
+  assert.equal(ghostPose(g, -0.1), null);
+  assert.equal(ghostPose(g, g.time + 0.1), null);
+  assert.equal(ghostPose(null, 1), null);
+});
+
+test('ghost: only a faster lap replaces it, and the gap is measured at each gate', () => {
+  // a stand-in sim: laps of 10 s, 8 s and 9 s on a three-gate course
+  const sim = { t: 0, state: { lapStart: null }, events: [], drone: { pos: [0, 2, 0], yaw: 3, thrust: [0, 9.81, 0] } };
+  const rec = makeGhostRecorder();
+  const run = (to) => {
+    for (; sim.t < to - 1e-9; sim.t += 0.01) {
+      sim.drone.pos = [sim.t, 2, 0];
+      recordGhost(rec, sim);
+    }
+  };
+  const gate = (id, lap) => {
+    sim.events.push({ t: sim.t, type: 'gate', gate: id });
+    if (id === 0) {
+      if (sim.state.lapStart != null) sim.events.push({ t: sim.t, type: 'lap', time: sim.t - sim.state.lapStart });
+      sim.state.lapStart = sim.t;
+    }
+  };
+  run(1); gate(0);
+  run(4); gate(1); run(7); gate(2); run(11); gate(0); // 10 s
+  assert.equal(rec.best?.time, undefined); // kept on the next recordGhost call
+  run(13); gate(1); run(16); gate(2); run(19); gate(0); // 8 s
+  run(22); gate(1); run(22.5);
+  assert.ok(rec.gap.gate === 1 && Math.abs(rec.gap.delta - 1) < 1e-6, JSON.stringify(rec.gap));
+  run(25); gate(2); run(28); gate(0); // 9 s
+  run(28.5);
+  assert.ok(rec.gap.gate === 0 && Math.abs(rec.gap.delta - 1) < 1e-6, JSON.stringify(rec.gap));
+  assert.ok(Math.abs(rec.best.time - 8) < 1e-6, `best ${rec.best.time}`);
+  assert.equal(rec.improved, 2);
+  assert.ok(Math.abs(rec.best.gates[1] - 2) < 1e-6 && Math.abs(rec.best.gates[2] - 5) < 1e-6);
+  assert.ok(Math.abs(ghostGap(rec.best, 1, 3) - 1) < 1e-6); // reached gate 1 a second later
+  assert.equal(ghostGap(rec.best, 7, 3), null);
+  // the replay starts where the lap started and moves with it
+  assert.ok(Math.abs(ghostPose(rec.best, 0).pos[0] - 11) < 0.02);
+  assert.ok(Math.abs(ghostPose(rec.best, 4.025).pos[0] - 15.025) < 0.02);
+});
+
+test('ghost: survives a save and load, rejects junk, and replays a crash tumble', () => {
+  const sim = makeSim({ seed: 2, pilot: 'manual', launchAt: 0, optimise: false });
+  const rec = makeGhostRecorder();
+  for (let i = 0; i < 90 * 120 && !rec.best; i++) {
+    sim.stick = botSticks(sim);
+    step(sim, 1 / 120);
+    recordGhost(rec, sim);
+  }
+  const g = rec.best;
+  assert.ok(g, 'stick pilot never finished a lap');
+  const text = encodeGhost(g), back = decodeGhost(text);
+  assert.ok(text.length < 60000, `${text.length} chars`);
+  assert.ok(Math.abs(back.time - g.time) < 1e-9);
+  for (let t = 0; t < g.time; t += 0.37) {
+    const a = ghostPose(g, t), b = ghostPose(back, t);
+    assert.ok(v3.len(v3.sub(a.pos, b.pos)) < 0.02 && Math.abs(a.yaw - b.yaw) < 0.002);
+  }
+  for (const junk of ['', 'nope', '{}', '{"v":1,"time":5,"q":[1,2,3]}', '{"v":99,"time":5,"q":[]}']) {
+    assert.equal(decodeGhost(junk), null, junk);
+  }
+  // a tumble is recorded as axis * angle and comes back as a unit axis and an angle
+  const d = { pos: [0, 3, 0], yaw: 0, thrust: [0, 9.81, 0], tumble: { axis: [0, 0, 1], angle: 1.2, rate: 6 } };
+  const fake = { t: 0, state: { lapStart: 0 }, events: [], drone: d };
+  const r2 = makeGhostRecorder();
+  for (; fake.t < 1; fake.t += 0.01) recordGhost(r2, fake);
+  const q = ghostPose({ ...r2.cur, time: 1 }, 0.5);
+  assert.ok(q.tumble && Math.abs(q.tumble.angle - 1.2) < 1e-9 && q.tumble.axis[2] === 1);
 });

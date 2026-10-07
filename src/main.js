@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { makeSim, step, GATE_INNER, v3, DIFFICULTIES, NAV_MODES, WIND_MODES, PILOTS, DRONE } from './sim.js';
 import { makeRace, syncRace, raceGap } from './race.js';
+import { makeGhostRecorder, recordGhost, ghostPose, encodeGhost, decodeGhost } from './ghost.js';
 import { makeTelemetry, resetTelemetry, sampleTelemetry, drawTelemetry } from './telemetry.js';
 
 const DT = 1 / 120;
@@ -56,6 +57,8 @@ let sim, seed = 1, difficulty = 'normal', pilot = 'racing', nav = 'truth', world
 let ghosts = [], lineVersion = -1, windMode = 'off';
 // manual flight: you fly `sim`, the racing-line autopilot flies `rival` on the same course
 let rival = null, race = null, pb = null;
+// ghost replay: a gold drone flying the best lap so far (yours are kept per course)
+let ghostRec = makeGhostRecorder(), ghostOn = true;
 const COUNTDOWN = 3; // s on the pad before a race starts
 const telemetry = makeTelemetry($('telemetry'));
 scene.add(world);
@@ -132,6 +135,8 @@ function buildWorld() {
   rival = manual ? makeSim({ seed, pilot: 'racing', difficulty, nav, wind: windMode, launchAt: COUNTDOWN }) : null;
   race = manual ? makeRace() : null;
   pb = manual ? loadPb() : null;
+  ghostRec = makeGhostRecorder(manual ? loadGhost() : null);
+  ghostMesh.visible = false;
   rivalMesh.visible = manual;
   $('countdown').hidden = true;
   $('pads').hidden = !(manual && coarse);
@@ -244,6 +249,23 @@ rivalMesh.traverse((o) => {
 });
 rivalMesh.visible = false;
 scene.add(rivalMesh);
+
+// the ghost of the best lap: the same drone again, in translucent gold
+const bestGhostMat = new THREE.MeshBasicMaterial({ color: '#ffc94d', transparent: true, opacity: 0.45, depthWrite: false });
+const ghostMesh = drone.clone(true);
+ghostMesh.traverse((o) => {
+  if (o.isMesh) { o.material = bestGhostMat; o.castShadow = false; }
+});
+ghostMesh.visible = false;
+scene.add(ghostMesh);
+// Fly the ghost to where the best lap was at this point in the current lap. Hidden when
+// it sits right on top of the drone (a repeatable autopilot lap matches itself).
+function updateGhost() {
+  const s = sim.state;
+  const pose = ghostOn && s.lapStart != null ? ghostPose(ghostRec.best, sim.t - s.lapStart) : null;
+  ghostMesh.visible = !!pose && v3.len(v3.sub(pose.pos, sim.drone.pos)) > 0.8;
+  if (ghostMesh.visible) syncMesh(ghostMesh, pose);
+}
 
 // onboard camera mounted on the nose, tilted up like a real FPV cam
 const camMount = new THREE.Object3D();
@@ -360,6 +382,13 @@ function updateHud(force) {
       el.className = up > 0 ? 'behind' : '';
     }
   }
+  // ghost: gap to the best lap at the last gate passed (+ slower, − faster)
+  $('r-ghost').hidden = $('s-ghost').hidden = !ghostRec.best;
+  if (ghostRec.best) {
+    const g = ghostRec.gap, el = $('s-ghost');
+    el.textContent = !g ? fmt(ghostRec.best.time) : Math.abs(g.delta) < 0.005 ? '0.00 s' : `${g.delta > 0 ? '+' : '−'}${Math.abs(g.delta).toFixed(2)} s`;
+    el.className = !g ? '' : g.delta > 0.005 ? 'behind' : g.delta < -0.005 ? 'ahead' : '';
+  }
   $('s-course').textContent = `#${seed} ${difficulty}`;
   // vision: how far out the map is for the next gate, and how far out the estimate is now
   $('r-vis').hidden = $('s-vis').hidden = !sim.belief;
@@ -417,6 +446,14 @@ function loadPb() {
 function savePb(t) {
   try { localStorage.setItem(pbKey(), String(t)); } catch { /* storage unavailable */ }
 }
+// your best lap's ghost, per course, in this browser only
+const ghostKey = () => `drone-sim:ghost:${seed}:${difficulty}:${windMode}`;
+function loadGhost() {
+  try { return decodeGhost(localStorage.getItem(ghostKey()) ?? ''); } catch { return null; }
+}
+function saveGhost(g) {
+  try { localStorage.setItem(ghostKey(), encodeGhost(g)); } catch { /* storage unavailable or full */ }
+}
 let toastTimer;
 function toast(msg, bad = false) {
   const el = $('toast');
@@ -434,8 +471,8 @@ const NAV_NOTES = {
 };
 const coarse = matchMedia('(pointer: coarse)').matches;
 const MANUAL_NOTE = coarse
-  ? '<b>You fly.</b> Left stick: speed and turn. Right stick: climb and drift (height is held for you). Beat the cyan ghost: it\'s the autopilot.'
-  : '<b>You fly.</b> <b>W</b>/<b>↑</b> speed, <b>A D</b>/<b>← →</b> turn, <b>Space</b>/<b>Shift</b> climb (height is held for you). Gamepads work too. Beat the cyan ghost: it\'s the autopilot.';
+  ? '<b>You fly.</b> Left stick: speed and turn. Right stick: climb and drift (height is held for you). Beat the cyan ghost: it\'s the autopilot. The gold ghost is your best lap.'
+  : '<b>You fly.</b> <b>W</b>/<b>↑</b> speed, <b>A D</b>/<b>← →</b> turn, <b>Space</b>/<b>Shift</b> climb (height is held for you). Gamepads work too. Beat the cyan ghost: it\'s the autopilot. The gold ghost is your best lap.';
 let noteTimer;
 function showNavNote() {
   const el = $('nav-note');
@@ -473,6 +510,11 @@ $('b-tm').onclick = () => {
   el.hidden = !el.hidden;
   $('b-tm').classList.toggle('on', !el.hidden);
   if (!el.hidden) drawTelemetry(telemetry, sim);
+};
+$('b-ghost').onclick = () => {
+  ghostOn = !ghostOn;
+  $('b-ghost').classList.toggle('on', ghostOn);
+  toast(ghostOn ? 'Ghost on' : 'Ghost off');
 };
 $('b-wind').onclick = () => {
   windMode = WIND_MODES[(WIND_MODES.indexOf(windMode) + 1) % WIND_MODES.length];
@@ -594,6 +636,7 @@ addEventListener('keydown', (e) => {
   if (e.key === 'v') $('b-nav').click();
   if (e.key === 'w') $('b-wind').click();
   if (e.key === 't') $('b-tm').click();
+  if (e.key === 'g') $('b-ghost').click();
 });
 
 // ---------- onboard overlay: what the camera detected this frame ----------
@@ -712,6 +755,7 @@ function frame(now) {
   let steps = 0;
   while (acc >= DT && steps < 1200) {
     step(sim, DT);
+    if (recordGhost(ghostRec, sim) && pilot === 'manual') saveGhost(ghostRec.best);
     if (rival) step(rival, DT);
     sampleTelemetry(telemetry, sim);
     acc -= DT;
@@ -724,6 +768,7 @@ function frame(now) {
     syncMesh(rivalMesh, rival.drone);
     updateCountdown();
   }
+  updateGhost();
   updateStreaks(steps * DT);
   updateDebris(steps * DT);
   propSpin += dtFrame * 60;
