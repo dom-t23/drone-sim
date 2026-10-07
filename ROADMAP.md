@@ -11,7 +11,8 @@ A rough backlog, not a contract. Each night picks the item that will make the bi
   - **Next steps:** minimum-snap or time-optimal (e.g. CPC-style) trajectories instead of Hermite segments; let the planner trade crossing offset against tracking margin per gate; speed up the optimiser (incremental re-planning of the two segments a gate touches) so vision can re-shape continuously. Retighten the lap-time test after each gain.
 - [x] **Wind and disturbances.** Steady wind + capped Gauss-Markov gusts, disturbance observer, forecast-aware planning margins (2026-10-04).
   - **Next steps:** sensor noise and motor lag variation (best done with vision step 2's state estimator); spatially varying wind (gusts that sweep across the course); estimate the wind direction per lap and bias the line to use tailwinds.
-- [ ] **Crashes.** Gate-frame and pillar collisions, with a tumble and respawn.
+- [x] **Crashes.** Gate frames, legs and scenery pillars are solid; a real hit tumbles the drone to the ground, then it respawns just past the last gate passed. The pursuit pilot learned to go round instead of scraping frames (2026-10-07).
+  - **Next steps:** a ground strike at speed should crash too (today the ground just catches you); camera shake and a crash sound; a "crashes" toggle or a no-respawn hardcore mode; let the racing-line planner know the drone's real size and the legs, so shaping can clip tighter where it's safe; make map-only crash for real once it can recover (e.g. vision kicks in after its first crash).
 
 ## Seeing
 - [x] **Vision mode, step 1.** Map with every gate moved up to 2.6 m; synthetic onboard camera (corner noise, dropouts, wild corners); PnP by Levenberg-Marquardt; misfit check + innovation gating; per-gate information filter; in-flight re-planning; detection overlay, ghost gates and map-only comparison mode (2026-10-04).

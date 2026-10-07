@@ -26,9 +26,9 @@ The course is in the URL, e.g. https://dom-t23.github.io/drone-sim/#seed=12&d=ha
 
 ## How it works
 
-- `src/sim.js` is the simulation core with no rendering dependencies: course generation (three difficulties; hard adds big climbs, angled gates and dive gates), quadrotor dynamics (thrust vector with tilt and thrust limits, first-order lag, drag), the racing-line planner, both autopilots, the assisted manual pilot, gate/lap detection, and vision mode (camera model, PnP, gating and fusion, in-flight re-planning).
+- `src/sim.js` is the simulation core with no rendering dependencies: course generation (three difficulties; hard adds big climbs, angled gates and dive gates), quadrotor dynamics (thrust vector with tilt and thrust limits, first-order lag, drag), the racing-line planner, both autopilots, the assisted manual pilot, gate/lap detection, collisions with gate frames, legs and pillars (crash, tumble and respawn), and vision mode (camera model, PnP, gating and fusion, in-flight re-planning).
 - `src/main.js` renders it with three.js and runs the sim at a fixed 120 Hz timestep; `src/telemetry.js` draws the telemetry panel, `src/splits.js` works out gate splits and `src/race.js` the gap to the rival when you race it.
-- `test/` holds headless checks run with `npm test` (Node 18+). They fly a set of course seeds on every difficulty and nav mode and fail if the drone misses gates, strays from its line, gets slower, mis-estimates gates, or the state goes non-finite.
+- `test/` holds headless checks run with `npm test` (Node 18+). They fly a set of course seeds on every difficulty and nav mode and fail if the drone misses gates, crashes, strays from its line, gets slower, mis-estimates gates, or the state goes non-finite.
 
 The default autopilot flies a **racing line**: a smooth closed spline through every gate, crossing each one square-on. Where it crosses each opening (up to 0.6 m off centre) and how hard it swings in are tuned by coordinate descent on the planned lap time. Each point on it gets the fastest speed whose turn still fits the drone's tilt and thrust limits, then forward and backward passes add acceleration and braking, using only what the turn leaves of that envelope (a friction circle), so it brakes early for corners over a crest. The tracker feeds forward the acceleration the path needs (turning, speeding up, beating drag) and corrects any position and velocity error with PD feedback. The line on the course shows the plan, coloured blue (slow) to orange (fast).
 
@@ -38,7 +38,9 @@ The default autopilot flies a **racing line**: a smooth closed spline through ev
 
 **Manual flight** works like a camera drone's velocity mode: the sticks ask for a forward speed, turn rate, climb rate and sideways drift, and the same thrust-vector loop delivers them within the airframe's limits. The turn rate is capped by speed so the drone follows its nose, and with the climb stick centred it eases to the next gate's height.
 
-The original autopilot, still available with the **Pilot** button, is pure pursuit along each gate's axis: the drone chases a point sliding along the line through the gate centre, so it lines up and flies straight through, slowing for sharp turns.
+**Crashes**: gates, their legs and the scenery pillars are solid. A real hit cuts the motors and the drone tumbles to the ground, then respawns on the line just past the last gate it passed; a light touch just slides it along. Map-only mode is a ghost run and flies through frames.
+
+The original autopilot, still available with the **Pilot** button, is pure pursuit along each gate's axis: the drone chases a point sliding along the line through the gate centre, so it lines up and flies straight through, slowing for sharp turns. If it predicts it would cross a gate off the opening, it swings wide and comes round for another try.
 
 ## Run locally
 

@@ -151,6 +151,9 @@ export const AUTOPILOT = {
   lookahead: 7, // m
   kVel: 3.2, // 1/s, velocity tracking gain
   turnSlowdown: 0.55, // fraction of speed shed when the next gate needs a sharp turn
+  commit: 7, // m before the gate: too far off line by here means go round again
+  goAroundWide: 3.4, // m off the gate centre when going round for another try
+  offAxisSlowdown: 0.6, // and when it is well off the gate's axis close in
 };
 
 export function autopilot(drone, course, state) {
@@ -160,11 +163,19 @@ export function autopilot(drone, course, state) {
   const lateral = v3.sub(rel, v3.scale(gate.normal, along));
   const latDist = v3.len(lateral);
 
+  // where it would cross the gate's plane if it held its current velocity
+  const vAlong = v3.dot(drone.vel, gate.normal);
+  const tCross = -along / Math.max(vAlong, 1);
+  const latCross = v3.len(v3.add(lateral, v3.scale(v3.sub(drone.vel, v3.scale(gate.normal, vAlong)), tCross)));
+  const clear = GATE_INNER * 0.5 - CRASH.radius;
   let carrot;
-  if (along > 1.0 || (along > -1.0 && latDist > GATE_INNER * 0.5)) {
+  if (along > 1.0 || (along > -1.0 && latDist > GATE_INNER * 0.5)
+    || (along > -AUTOPILOT.commit && latDist > clear && latCross > clear)) {
     // past the plane without going through (or about to clip the frame): go round to
-    // the front for another approach rather than chasing the axis off into the distance
-    carrot = v3.sub(gate.pos, v3.scale(gate.normal, 10));
+    // the front for another approach rather than chasing the axis off into the distance,
+    // swinging wide of the frame so the way back doesn't run into it
+    const wide = latDist > 1e-6 ? v3.scale(lateral, Math.max(latDist, AUTOPILOT.goAroundWide) / latDist) : [0, 0, 0];
+    carrot = v3.add(v3.add(gate.pos, wide), v3.scale(gate.normal, -10));
   } else {
     carrot = v3.add(gate.pos, v3.scale(gate.normal, along + AUTOPILOT.lookahead));
   }
@@ -175,7 +186,9 @@ export function autopilot(drone, course, state) {
   const next = course.gates[(state.target + 1) % course.gates.length];
   const turn = 1 - v3.dot(gate.normal, next.normal); // 0 = straight, 2 = U-turn
   const near = Math.max(0, 1 - Math.abs(along) / 15);
-  const speed = AUTOPILOT.cruise * (1 - AUTOPILOT.turnSlowdown * Math.min(1, turn) * near);
+  let speed = AUTOPILOT.cruise * (1 - AUTOPILOT.turnSlowdown * Math.min(1, turn) * near);
+  // off the axis on the run in: ease off, so a late correction doesn't end in the frame
+  if (along < 0) speed *= 1 - AUTOPILOT.offAxisSlowdown * Math.min(1, latDist / GATE_INNER) * near;
 
   const vDes = v3.scale(v3.norm(v3.sub(carrot, drone.pos)), speed);
   const aDes = v3.scale(v3.sub(vDes, drone.vel), AUTOPILOT.kVel);
@@ -402,7 +415,7 @@ export function racingPilot(sim) {
   const ahead = Math.round((speed * DRONE.thrustLag) / plan.ds);
   const q = plan.pts[track.idx];
   const qa = plan.pts[(track.idx + ahead) % N];
-  const cap = 3 + P.launchRate * (sim.t - sim.launchAt); // gentle launch from a standstill
+  const cap = 3 + P.launchRate * (sim.t - Math.max(sim.launchAt, sim.respawnAt ?? -Infinity)); // gentle launch from a standstill
   const vRef = Math.min(qa.v, cap);
   const atRef = vRef < qa.v ? Math.min(P.aAccel, P.launchRate) : qa.at;
   const velRef = v3.scale(qa.t, vRef);
@@ -859,13 +872,185 @@ export function manualPilot(sim, dt) {
   return v3.add(a, [0, G, 0]);
 }
 
+// ---------- obstacles and crashes ----------
+// Everything solid on the course: each gate's four frame bars and its two support legs
+// (the same sizes main.js draws), and the scenery pillars. The drone is a sphere the size
+// of the real airframe (the rendered model is drawn larger than life). A glancing touch
+// just pushes it off; a real hit cuts the motors, it tumbles to the ground and respawns
+// on the line just after the last gate it passed, so a crash costs time, never progress.
+export const FRAME = { bar: 0.28, legRadius: 0.06 };
+export const CRASH = {
+  radius: 0.3, // m, drone collision sphere
+  minSpeed: 1.5, // m/s into the surface: slower touches only push the drone off
+  restitution: 0.3,
+  tumble: 1.4, // s on the ground before respawning
+  hold: 0.5, // s hovering at the respawn point before the pilot takes over
+  after: 3, // m past the last gate passed (along the line) to respawn
+  pillarClear: 7, // m between the course and any scenery pillar
+};
+
+// Scenery pillars, seeded per course; the layout is the one the page has always drawn,
+// minus any pillar that would stand within reach of the course.
+export function makeScenery(course, seed = course.seed) {
+  const rand = mulberry32(seed * 7919);
+  const path = [];
+  for (let i = 0; i < 360; i++) path.push(course.curve((i / 360) * Math.PI * 2));
+  for (const g of course.gates) path.push(g.pos, v3.sub(g.pos, v3.scale(g.normal, 18)));
+  const pillars = [];
+  for (let i = 0; i < 90; i++) {
+    const a = rand() * Math.PI * 2;
+    const r = rand() < 0.5 ? 8 + rand() * 18 : 75 + rand() * 90;
+    const h = 2 + rand() * (r > 60 ? 22 : 6);
+    const w = 1 + rand() * 3;
+    const yaw = rand() * Math.PI;
+    const p = { pos: [Math.cos(a) * r, h / 2, Math.sin(a) * r], size: [w, h, w], yaw };
+    const reach = CRASH.pillarClear + w * Math.SQRT1_2;
+    if (path.every((q) => Math.hypot(q[0] - p.pos[0], q[2] - p.pos[2]) > reach)) pillars.push(p);
+  }
+  return { pillars };
+}
+
+// Nearest point of an axis-aligned box (centre 0, half sizes h) to a local point l.
+function boxClosest(l, h) {
+  return [Math.max(-h[0], Math.min(h[0], l[0])), Math.max(-h[1], Math.min(h[1], l[1])), Math.max(-h[2], Math.min(h[2], l[2]))];
+}
+
+// Every solid shape near p: returns the closest contact within the drone's radius as
+// { n (unit, away from the obstacle), depth, what, gate }, or null.
+export function collide(sim, p) {
+  const R = CRASH.radius, s = GATE_INNER, t = FRAME.bar;
+  let best = null;
+  const consider = (d, n, what, gate) => {
+    if (d < R && (!best || d < R - best.depth)) best = { n, depth: R - d, what, gate };
+  };
+  for (const g of sim.course.gates) {
+    const o = v3.sub(p, g.pos);
+    if (o[0] * o[0] + o[2] * o[2] > 36) continue; // legs are vertical, so judge by horizontal distance
+    const l = [v3.dot(o, g.right), v3.dot(o, g.up), v3.dot(o, g.normal)];
+    for (const [w, h, x, y] of [[s + 2 * t, t, 0, (s + t) / 2], [s + 2 * t, t, 0, -(s + t) / 2], [t, s, (s + t) / 2, 0], [t, s, -(s + t) / 2, 0]]) {
+      const ll = [l[0] - x, l[1] - y, l[2]];
+      const c = boxClosest(ll, [w / 2, h / 2, t / 2]);
+      const dl = [ll[0] - c[0], ll[1] - c[1], ll[2] - c[2]];
+      const d = v3.len(dl);
+      if (d >= R) continue;
+      // back to world: dl = right*x + up*y + normal*z (inside the bar: push along the gate normal)
+      const nw = d > 1e-9
+        ? v3.add(v3.add(v3.scale(g.right, dl[0] / d), v3.scale(g.up, dl[1] / d)), v3.scale(g.normal, dl[2] / d))
+        : v3.scale(g.normal, l[2] >= 0 ? 1 : -1);
+      consider(d, nw, 'gate', g.id);
+    }
+    for (const side of [-1, 1]) {
+      const c = v3.sub(v3.add(g.pos, v3.scale(g.right, side * (s + t) / 2)), v3.scale(g.up, s / 2 + t));
+      if (c[1] < 0.1 || p[1] > c[1] + R) continue;
+      const dx = p[0] - c[0], dz = p[2] - c[2], dh = Math.hypot(dx, dz);
+      const dy = Math.max(0, p[1] - c[1]);
+      const d = Math.hypot(Math.max(0, dh - FRAME.legRadius), dy);
+      if (d >= R) continue;
+      const n = dy > 0 && dh <= FRAME.legRadius ? [0, 1, 0] : v3.norm([dx || 1e-6, 0, dz]);
+      consider(d, n, 'gate', g.id);
+    }
+  }
+  for (const q of sim.scenery?.pillars ?? []) {
+    const dx = p[0] - q.pos[0], dz = p[2] - q.pos[2];
+    if (dx * dx + dz * dz > (q.size[0] + R + 1) ** 2) continue;
+    // into the pillar's frame (three.js yaw about +Y)
+    const c = Math.cos(q.yaw), sn = Math.sin(q.yaw);
+    const l = [dx * c - dz * sn, p[1] - q.pos[1], dx * sn + dz * c];
+    const h = [q.size[0] / 2, q.size[1] / 2, q.size[2] / 2];
+    const k = boxClosest(l, h);
+    const dl = [l[0] - k[0], l[1] - k[1], l[2] - k[2]];
+    const d = v3.len(dl);
+    if (d >= R) continue;
+    let nl = d > 1e-9 ? v3.scale(dl, 1 / d) : [Math.sign(l[0]) || 1, 0, 0];
+    const nw = [nl[0] * c + nl[2] * sn, nl[1], -nl[0] * sn + nl[2] * c];
+    consider(d, nw, 'pillar', null);
+  }
+  return best;
+}
+
+// Hit something: push out, bounce, cut the motors and start the tumble.
+function startCrash(sim, hit, vn) {
+  const d = sim.drone;
+  d.pos = v3.add(d.pos, v3.scale(hit.n, hit.depth));
+  d.vel = v3.sub(d.vel, v3.scale(hit.n, (1 + CRASH.restitution) * vn));
+  d.vel = v3.scale(d.vel, 0.6);
+  let axis = v3.norm([hit.n[1] * d.vel[2] - hit.n[2] * d.vel[1], hit.n[2] * d.vel[0] - hit.n[0] * d.vel[2], hit.n[0] * d.vel[1] - hit.n[1] * d.vel[0]]);
+  if (v3.len(axis) < 0.5) axis = [1, 0, 0];
+  d.tumble = { axis, angle: 0, rate: Math.min(22, 4 + 1.5 * Math.abs(vn)) };
+  sim.crash = { t: sim.t, until: sim.t + CRASH.tumble, what: hit.what, gate: hit.gate, speed: Math.abs(vn) };
+  sim.state.crashes++;
+  sim.events.push({ t: sim.t, type: 'crash', what: hit.what, gate: hit.gate, speed: Math.abs(vn), pos: d.pos.slice() });
+}
+
+// Motors off: fall, bounce on the ground, spin down; then respawn.
+function stepCrash(sim, dt) {
+  const d = sim.drone;
+  const air = sim.wind ? v3.sub(d.vel, sim.wind.now) : d.vel;
+  d.vel = v3.add(d.vel, v3.scale(v3.add([0, -G, 0], v3.scale(air, -DRONE.drag)), dt));
+  d.pos = v3.add(d.pos, v3.scale(d.vel, dt));
+  if (d.pos[1] < 0.15) {
+    d.pos[1] = 0.15;
+    if (d.vel[1] < 0) d.vel[1] = -0.35 * d.vel[1];
+    const f = Math.exp(-4 * dt);
+    d.vel[0] *= f; d.vel[2] *= f;
+    d.tumble.rate *= Math.exp(-3 * dt);
+  }
+  d.tumble.angle += d.tumble.rate * dt;
+  if (sim.wind) stepWind(sim.wind, dt);
+  sim.t += dt;
+  if (sim.t >= sim.crash.until) respawn(sim);
+}
+
+// Sweep the step from prev to the new position in short hops so nothing thin is skipped.
+// Returns true if the drone crashed this step.
+function checkContact(sim, prev) {
+  const d = sim.drone, seg = v3.sub(d.pos, prev);
+  const n = Math.max(1, Math.ceil(v3.len(seg) / 0.2));
+  for (let k = 1; k <= n; k++) {
+    const p = k === n ? d.pos : v3.add(prev, v3.scale(seg, k / n));
+    const hit = collide(sim, p);
+    if (!hit) continue;
+    d.pos = p;
+    const vn = v3.dot(d.vel, hit.n);
+    if (vn < -CRASH.minSpeed) {
+      startCrash(sim, hit, vn);
+      return true;
+    }
+    // a light touch: slide off the surface
+    d.pos = v3.add(d.pos, v3.scale(hit.n, hit.depth));
+    if (vn < 0) d.vel = v3.sub(d.vel, v3.scale(hit.n, vn));
+    return false;
+  }
+  return false;
+}
+
+function respawn(sim) {
+  const d = sim.drone, { plan, state } = sim, N = plan.pts.length;
+  if (state.gatesPassed > 0) {
+    const last = (state.target - 1 + sim.course.gates.length) % sim.course.gates.length;
+    const q = plan.pts[(Math.round((plan.gateS[last] + CRASH.after) / plan.ds) + N) % N];
+    d.pos = [q.p[0], Math.max(1.5, q.p[1]), q.p[2]];
+    d.yaw = Math.atan2(q.t[0], q.t[2]);
+  } else {
+    d.pos = sim.start.pos.slice();
+    d.yaw = sim.start.yaw;
+  }
+  d.vel = [0, 0, 0];
+  d.thrust = [0, G, 0];
+  delete d.tumble;
+  sim.track.idx = nearestIndex(plan, d.pos, 0, 0, N);
+  sim.crash = null;
+  sim.respawnAt = sim.t + CRASH.hold;
+  sim.events.push({ t: sim.t, type: 'respawn' });
+}
+
 // ---------- simulation ----------
 export const PILOTS = ['racing', 'pursuit', 'manual'];
 
 // nav: 'truth' flies from the true gate positions; 'vision' starts from a map with every
 // gate moved and corrects it with the camera; 'blind' trusts the map and nothing else.
 // wind: 'off', 'breezy' or 'gusty'; observer: whether the pilot estimates and cancels it.
-export function makeSim({ seed = 1, gates, pilot = 'racing', difficulty = 'normal', nav = 'truth', optimise = true, wind = 'off', observer = true, launchAt = null } = {}) {
+export function makeSim({ seed = 1, gates, pilot = 'racing', difficulty = 'normal', nav = 'truth', optimise = true, wind = 'off', observer = true, launchAt = null, crashes } = {}) {
   const course = makeCourse({ seed, gates, difficulty });
   if (!NAV_MODES.includes(nav)) nav = 'truth';
   const belief = nav === 'truth' ? null : makeMap(course, seed);
@@ -879,13 +1064,22 @@ export function makeSim({ seed = 1, gates, pilot = 'racing', difficulty = 'norma
   const plan = planRacingLine(belief ?? course, { ...planOpts, shape });
   if (course.difficulty !== 'normal') {
     // start hovering on the racing line, 18 m before the start gate, so the launch is a
-    // level run along the line even when the course climbs or curves into the first gate
-    const N = plan.pts.length;
-    const q = plan.pts[(Math.round((plan.gateS[0] - 18) / plan.ds) + N) % N];
+    // level run along the line even when the course climbs or curves into the first gate.
+    // On a short last leg, start a few metres past the last gate rather than in front of
+    // its frame.
+    const N = plan.pts.length, G0 = plan.gateS[0], last = plan.gateS[plan.gateS.length - 1];
+    const leg = (G0 - last + plan.length) % plan.length;
+    const q = plan.pts[(Math.round((G0 - Math.min(18, leg - 4)) / plan.ds) + N) % N];
     drone.pos = [q.p[0], Math.max(1.5, q.p[1]), q.p[2]];
     drone.yaw = Math.atan2(q.t[0], q.t[2]);
   }
   return {
+    // map-only flies through frames like a ghost run, so you can watch every miss
+    crashes: crashes ?? nav !== 'blind',
+    scenery: makeScenery(course, seed),
+    start: { pos: drone.pos.slice(), yaw: drone.yaw },
+    crash: null, // { t, until, what, gate } while tumbling
+    respawnAt: -Infinity,
     course,
     drone,
     pilot,
@@ -912,15 +1106,16 @@ export function makeSim({ seed = 1, gates, pilot = 'racing', difficulty = 'norma
     stick: { x: 0, y: 0, z: 0, s: 0 }, // manual pilot's inputs
     track: { idx: nearestIndex(plan, drone.pos, 0, 0, plan.pts.length) },
     t: 0,
-    state: { target: 0, gatesPassed: 0, misses: 0, lap: 0, lapStart: null, laps: [] },
+    state: { target: 0, gatesPassed: 0, misses: 0, crashes: 0, lap: 0, lapStart: null, laps: [] },
     events: [],
   };
 }
 
 export function step(sim, dt) {
+  if (sim.crash) return stepCrash(sim, dt);
   const { drone, course, state } = sim;
   const want =
-    sim.t < sim.launchAt ? [0, G, 0] // sitting on the pad
+    sim.t < sim.launchAt || sim.t < sim.respawnAt ? [0, G, 0] // on the pad, or just respawned
       : sim.pilot === 'pursuit' ? autopilot(drone, sim.belief ?? course, state)
         : sim.pilot === 'manual' ? manualPilot(sim, dt)
           : racingPilot(sim);
@@ -951,6 +1146,10 @@ export function step(sim, dt) {
       sim.dist = v3.add(sim.dist, v3.scale(v3.sub(v3.sub(seen, model), sim.dist), Math.min(1, dt / WIND.observerTau)));
     }
     stepWind(sim.wind, dt);
+  }
+  if (sim.crashes && checkContact(sim, prev)) {
+    sim.t += dt;
+    return;
   }
   const hs = Math.hypot(drone.vel[0], drone.vel[2]);
   if (hs > 0.5 && sim.pilot !== 'manual') drone.yaw = Math.atan2(drone.vel[0], drone.vel[2]);

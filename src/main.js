@@ -152,24 +152,21 @@ function buildWorld() {
   resetTelemetry(telemetry);
   showNavNote();
 
-  // scenery for parallax: scattered pillars away from the course
-  const rand = mulberry(seed * 7919);
+  // scenery for parallax: scattered pillars away from the course (solid: sim.js owns them)
+  const list = sim.scenery.pillars;
   const pillarGeo = new THREE.BoxGeometry(1, 1, 1);
   const pillarMat = new THREE.MeshStandardMaterial({ color: '#2e3d55', roughness: 0.9 });
-  const pillars = new THREE.InstancedMesh(pillarGeo, pillarMat, 90);
+  const pillars = new THREE.InstancedMesh(pillarGeo, pillarMat, Math.max(1, list.length));
+  pillars.count = list.length;
   const m4 = new THREE.Matrix4();
-  for (let i = 0; i < 90; i++) {
-    const a = rand() * Math.PI * 2;
-    const r = rand() < 0.5 ? 8 + rand() * 18 : 75 + rand() * 90;
-    const h = 2 + rand() * (r > 60 ? 22 : 6);
-    const w = 1 + rand() * 3;
+  list.forEach((q, i) => {
     m4.compose(
-      new THREE.Vector3(Math.cos(a) * r, h / 2, Math.sin(a) * r),
-      new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), rand() * Math.PI),
-      new THREE.Vector3(w, h, w)
+      new THREE.Vector3(...q.pos),
+      new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), q.yaw),
+      new THREE.Vector3(...q.size)
     );
     pillars.setMatrixAt(i, m4);
-  }
+  });
   pillars.castShadow = pillars.receiveShadow = true;
   world.add(pillars);
 
@@ -271,6 +268,44 @@ function pushTrail(p) {
   trailGeo.attributes.position.needsUpdate = true;
 }
 
+// ---------- crash debris: a burst of sparks and bits that fall and fade ----------
+const DEBRIS = 48, DEBRIS_LIFE = 1.4;
+const debrisPos = new Float32Array(DEBRIS * 3), debrisVel = new Float32Array(DEBRIS * 3);
+const debrisGeo = new THREE.BufferGeometry();
+debrisGeo.setAttribute('position', new THREE.BufferAttribute(debrisPos, 3));
+const debrisMat = new THREE.PointsMaterial({ color: '#ffb057', size: 0.14, transparent: true, opacity: 0, depthWrite: false });
+const debris = new THREE.Points(debrisGeo, debrisMat);
+debris.frustumCulled = false;
+debris.visible = false;
+scene.add(debris);
+let debrisAge = Infinity;
+function burst(p, vel) {
+  for (let i = 0; i < DEBRIS; i++) {
+    const a = Math.random() * Math.PI * 2, up = Math.random() * 2 - 0.4, sp = 2 + Math.random() * 6;
+    debrisPos.set(p, i * 3);
+    debrisVel.set([vel[0] * 0.5 + Math.cos(a) * sp, vel[1] * 0.5 + up * sp, vel[2] * 0.5 + Math.sin(a) * sp], i * 3);
+  }
+  debrisAge = 0;
+  debris.visible = true;
+  debrisGeo.attributes.position.needsUpdate = true;
+}
+function updateDebris(dt) {
+  if (!debris.visible) return;
+  debrisAge += dt;
+  if (debrisAge > DEBRIS_LIFE) { debris.visible = false; return; }
+  for (let i = 0; i < DEBRIS * 3; i += 3) {
+    debrisVel[i + 1] -= 9.81 * dt;
+    for (let k = 0; k < 3; k++) debrisPos[i + k] += debrisVel[i + k] * dt;
+    if (debrisPos[i + 1] < 0.05) {
+      debrisPos[i + 1] = 0.05;
+      debrisVel[i + 1] *= -0.3;
+      debrisVel[i] *= 0.6; debrisVel[i + 2] *= 0.6;
+    }
+  }
+  debrisMat.opacity = 1 - debrisAge / DEBRIS_LIFE;
+  debrisGeo.attributes.position.needsUpdate = true;
+}
+
 // ---------- wind streaks: short dashes drifting with the wind around the drone ----------
 const STREAKS = 160, STREAK_BOX = 36;
 const streakPos = new Float32Array(STREAKS * 6), streakSeed = [];
@@ -308,7 +343,8 @@ function updateHud(force) {
   $('s-last').textContent = fmt(s.laps.at(-1));
   $('s-best').textContent = fmt(s.laps.length ? Math.min(...s.laps) : null);
   $('s-speed').textContent = `${(v3.len(sim.drone.vel) * 3.6).toFixed(0)} km/h`;
-  $('s-gates').textContent = s.misses ? `${s.gatesPassed} · ${s.misses} missed` : s.gatesPassed;
+  const extra = [s.misses && `${s.misses} missed`, s.crashes && `${s.crashes} crashed`].filter(Boolean);
+  $('s-gates').textContent = [s.gatesPassed, ...extra].join(' · ');
   $('s-plan').textContent = pilot === 'racing' ? fmt(sim.plan.lapTime) : rival ? fmt(rival.plan.lapTime) : '–';
   // race: gap to the rival at the last gate you've both passed (+ behind, − ahead)
   $('r-rival').hidden = $('s-rival').hidden = !race;
@@ -344,6 +380,11 @@ function updateHud(force) {
     if (e.type === 'lap') toast(race ? lapToast(e.time) : `Lap ${fmt(e.time)}`);
     if (e.type === 'gate') onGate(e.gate);
     if (e.type === 'miss') toast(`Missed gate ${e.gate + 1}`, true);
+    if (e.type === 'crash') {
+      toast(e.what === 'pillar' ? 'Crashed into a pillar' : `Crashed into gate ${e.gate + 1}`, true);
+      burst(e.pos, sim.drone.vel);
+    }
+    if (e.type === 'respawn') trailCount = 0; // don't draw a line to the respawn point
   }
 }
 function onGate(id) {
@@ -389,7 +430,7 @@ function toast(msg, bad = false) {
 // A short note on what the nav mode shows, faded out after a while.
 const NAV_NOTES = {
   vision: '<b>Vision.</b> The drone\'s map has every gate up to 2.6 m out. Its camera finds the real gates (corner boxes in the onboard view) and it re-plans through its estimates (cyan).',
-  blind: '<b>Map only.</b> The drone trusts a map with every gate up to 2.6 m out (cyan), so it misses gates.',
+  blind: '<b>Map only.</b> The drone trusts a map with every gate up to 2.6 m out (cyan), so it misses gates. As a ghost run, it flies straight through any frame it meets.',
 };
 const coarse = matchMedia('(pointer: coarse)').matches;
 const MANUAL_NOTE = coarse
@@ -619,12 +660,18 @@ let acc = 0, last = performance.now(), propSpin = 0, frameNo = 0;
 const controls = document.querySelector('.controls');
 let controlsTop = controls.getBoundingClientRect().top;
 
+const spinQ = new THREE.Quaternion(), spinAxis = new THREE.Vector3();
 function syncMesh(mesh, d) {
   mesh.position.set(...d.pos);
   yawQ.setFromAxisAngle(UP, d.yaw);
   tmpV.set(...v3.norm(d.thrust));
   tmpQ.setFromUnitVectors(UP, tmpV);
   mesh.quaternion.copy(tmpQ).multiply(yawQ);
+  if (d.tumble) {
+    // crashed: spin about the axis the impact gave it
+    spinQ.setFromAxisAngle(spinAxis.set(...d.tumble.axis), d.tumble.angle);
+    mesh.quaternion.premultiply(spinQ);
+  }
 }
 function syncDrone() { syncMesh(drone, sim.drone); }
 
@@ -678,6 +725,7 @@ function frame(now) {
     updateCountdown();
   }
   updateStreaks(steps * DT);
+  updateDebris(steps * DT);
   propSpin += dtFrame * 60;
   updateCameras(dtFrame);
   updateHud();
@@ -729,15 +777,6 @@ addEventListener('resize', () => {
   chaseCam.aspect = innerWidth / innerHeight;
   chaseCam.updateProjectionMatrix();
 });
-
-function mulberry(a) {
-  return () => {
-    a |= 0; a = (a + 0x6d2b79f5) | 0;
-    let t = Math.imul(a ^ (a >>> 15), 1 | a);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
 
 readHash();
 buildWorld();

@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import {
   makeSim, step, planRacingLine, makeCourse, v3, GATE_INNER, DRONE, G, DIFFICULTIES,
   cameraPose, project, gateCorners, solveGatePose, CAMERA, optimiseLine, SHAPING, WIND,
-  MANUAL, headingAxes,
+  MANUAL, headingAxes, CRASH, FRAME, collide, makeScenery,
 } from '../src/sim.js';
 import { makeRace, syncRace, raceGap } from '../src/race.js';
 import { makeSplits, splitsOnEvent } from '../src/splits.js';
@@ -29,6 +29,7 @@ for (const pilot of ['racing', 'pursuit']) {
       const { laps, misses } = sim.state;
       assert.ok(laps.length >= 2, `seed ${seed}: only ${laps.length} laps`);
       assert.equal(misses, 0, `seed ${seed}: ${misses} missed gates`);
+      assert.equal(sim.state.crashes, 0, `seed ${seed}: ${sim.state.crashes} crashes`);
     }
   });
 }
@@ -279,6 +280,7 @@ for (const difficulty of DIFFICULTIES) {
     for (const seed of SEEDS) {
       const { sim, worstGate, estErr } = visionFlight(seed, difficulty);
       assert.equal(sim.state.misses, 0, `seed ${seed}: ${sim.state.misses} missed gates`);
+      assert.equal(sim.state.crashes, 0, `seed ${seed}: ${sim.state.crashes} crashes`);
       assert.ok(sim.state.laps.length >= 2, `seed ${seed}: only ${sim.state.laps.length} laps`);
       assert.ok(worstGate < GATE_INNER / 2 - 0.35, `seed ${seed}: passed ${worstGate.toFixed(2)} m off centre`);
       assert.ok(Math.max(...estErr) < 0.5, `seed ${seed}: a gate was passed with its estimate ${Math.max(...estErr).toFixed(2)} m out`);
@@ -356,6 +358,7 @@ for (const difficulty of DIFFICULTIES) {
         },
       });
       assert.equal(sim.state.misses, 0, `seed ${seed}: ${sim.state.misses} missed gates`);
+      assert.equal(sim.state.crashes, 0, `seed ${seed}: ${sim.state.crashes} crashes`);
       assert.ok(sim.state.laps.length >= 2, `seed ${seed}: only ${sim.state.laps.length} laps`);
       assert.ok(worstGate < GATE_INNER / 2 - 0.2, `seed ${seed}: passed ${worstGate.toFixed(2)} m off centre`);
     }
@@ -479,7 +482,8 @@ test('manual: full stick reaches top speed along the nose, and turns follow the 
 });
 
 test('manual: full descend stops at the floor, and nothing moves before the start countdown ends', () => {
-  const sim = makeSim({ seed: 1, pilot: 'manual', launchAt: 3 });
+  // collisions off: on seed 1 this low, straight run meets the first gate's bottom bar
+  const sim = makeSim({ seed: 1, pilot: 'manual', launchAt: 3, crashes: false });
   const start = sim.drone.pos.slice();
   sim.stick = { x: 1, y: 1, z: 1, s: 1 };
   for (let i = 0; i < 2.9 * 120; i++) step(sim, 1 / 120);
@@ -504,6 +508,7 @@ for (const difficulty of ['easy', 'normal']) {
       }
       assert.ok(sim.state.laps.length >= 2, `seed ${seed}: only ${sim.state.laps.length} laps`);
       assert.equal(sim.state.misses, 0, `seed ${seed}: ${sim.state.misses} missed gates`);
+      assert.equal(sim.state.crashes, 0, `seed ${seed}: ${sim.state.crashes} crashes`);
     }
   });
 }
@@ -544,4 +549,154 @@ test('race: a cautious stick pilot trails the racing-line rival, which keeps lap
   assert.ok(rival.state.laps.length >= 2 && rival.state.misses === 0);
   // the countdown delays the rival's first gate by the launch time, nothing more
   assert.ok(race.rival[0] > 3);
+});
+
+// ---------- crashes (2026-10-07) ----------
+
+const S = GATE_INNER, T = FRAME.bar;
+// a point on a gate in its own right / up / normal axes
+const onGate = (g, r, u, n = 0) => v3.add(v3.add(v3.add(g.pos, v3.scale(g.right, r)), v3.scale(g.up, u)), v3.scale(g.normal, n));
+
+test('collision shapes: the opening is clear, frame bars, legs and pillars are solid', () => {
+  for (const difficulty of DIFFICULTIES) {
+    const sim = makeSim({ seed: 4, difficulty, pilot: 'pursuit' });
+    for (const g of sim.course.gates) {
+      assert.equal(collide(sim, g.pos), null, 'gate centre is clear');
+      // anywhere a drone fits through the opening is clear
+      const edge = S / 2 - CRASH.radius - 0.01;
+      for (const [r, u] of [[edge, 0], [-edge, 0], [0, edge], [0, -edge], [edge * 0.7, edge * 0.7]]) {
+        assert.equal(collide(sim, onGate(g, r, u)), null, `gate ${g.id} (${r.toFixed(2)}, ${u.toFixed(2)}) should be clear`);
+      }
+      // the middle of each bar, from just in front: hit, pushed back towards the front
+      for (const [r, u] of [[0, (S + T) / 2], [0, -(S + T) / 2], [(S + T) / 2, 0], [-(S + T) / 2, 0]]) {
+        const hit = collide(sim, onGate(g, r, u, -(T / 2 + CRASH.radius - 0.05)));
+        assert.ok(hit && hit.what === 'gate' && hit.gate === g.id, `gate ${g.id}: bar at (${r}, ${u}) not solid`);
+        assert.ok(v3.dot(hit.n, g.normal) < -0.99, 'pushed out of the front face');
+        assert.ok(Math.abs(hit.depth - 0.05) < 1e-9);
+      }
+      // a leg, half way down, from the side
+      const foot = v3.sub(v3.add(g.pos, v3.scale(g.right, (S + T) / 2)), v3.scale(g.up, S / 2 + T));
+      if (foot[1] > 1) {
+        const p = [foot[0] + 0.2, foot[1] / 2, foot[2]];
+        const hit = collide(sim, p);
+        assert.ok(hit && hit.what === 'gate', `gate ${g.id}: leg not solid`);
+        assert.ok(hit.n[0] > 0.99, 'pushed off the leg sideways');
+      }
+    }
+    for (const q of sim.scenery.pillars.slice(0, 10)) {
+      assert.equal(collide(sim, [q.pos[0], q.size[1] + CRASH.radius + 0.01, q.pos[2]]), null, 'clear above a pillar');
+      const hit = collide(sim, [q.pos[0], q.size[1] + CRASH.radius - 0.1, q.pos[2]]);
+      assert.ok(hit?.what === 'pillar' && hit.n[1] > 0.99, 'pillar tops are solid');
+      const side = collide(sim, [q.pos[0] + q.size[0] * 0.5 * Math.cos(q.yaw), 1, q.pos[2] - q.size[0] * 0.5 * Math.sin(q.yaw)]);
+      assert.ok(side?.what === 'pillar', 'pillar sides are solid');
+    }
+  }
+});
+
+test('scenery: same pillars every time, none within reach of any racing line', () => {
+  for (const difficulty of DIFFICULTIES) {
+    for (const seed of SEEDS) {
+      const sim = makeSim({ seed, difficulty });
+      assert.deepEqual(makeScenery(sim.course).pillars, sim.scenery.pillars);
+      assert.ok(sim.scenery.pillars.length > 45, `${difficulty} ${seed}: only ${sim.scenery.pillars.length} pillars`);
+      let closest = Infinity;
+      for (const q of sim.scenery.pillars) {
+        for (const pt of sim.plan.pts) {
+          closest = Math.min(closest, Math.hypot(pt.p[0] - q.pos[0], pt.p[2] - q.pos[2]) - q.size[0] * Math.SQRT1_2);
+        }
+      }
+      assert.ok(closest > 4, `${difficulty} ${seed}: racing line passes ${closest.toFixed(1)} m from a pillar`);
+    }
+  }
+});
+
+// Put a manual drone just in front of a gate's top bar, nose on, and floor it.
+function ramTopBar(sim, gate) {
+  sim.assist = false;
+  sim.drone.pos = onGate(gate, 0, (S + T) / 2, -8);
+  sim.drone.vel = [0, 0, 0];
+  sim.drone.yaw = Math.atan2(gate.normal[0], gate.normal[2]);
+  sim.stick = { x: 0, y: 1, z: 0, s: 0 };
+}
+
+test('crash: a head-on hit tumbles to the ground, then respawns at the start and hovers', () => {
+  const sim = makeSim({ seed: 2, pilot: 'manual', optimise: false });
+  ramTopBar(sim, sim.course.gates[0]);
+  let crashedAt = null, high = 0, low = Infinity;
+  for (let i = 0; i < 3 * 120 && !crashedAt; i++) {
+    step(sim, 1 / 120);
+    if (sim.crash) crashedAt = sim.t;
+  }
+  assert.ok(crashedAt, 'never hit the bar');
+  assert.equal(sim.state.crashes, 1);
+  const e = sim.events.find((x) => x.type === 'crash');
+  assert.ok(e.what === 'gate' && e.gate === 0 && e.speed > 5, JSON.stringify(e));
+  assert.ok(sim.drone.tumble.rate > 4);
+  high = sim.drone.pos[1];
+  while (sim.crash) {
+    step(sim, 1 / 120);
+    low = Math.min(low, sim.drone.pos[1]);
+    assert.ok(sim.state.gatesPassed === 0, 'a tumble through a gate does not count');
+  }
+  assert.ok(sim.t - crashedAt >= CRASH.tumble - 1e-6);
+  assert.ok(low < 0.2 && high > 2, `fell from ${high.toFixed(1)} m to ${low.toFixed(2)} m`);
+  assert.equal(sim.events.at(-1).type, 'respawn');
+  assert.deepEqual(sim.drone.pos, sim.start.pos);
+  assert.equal(sim.drone.tumble, undefined);
+  // it hovers for a moment before the sticks come back
+  const at = sim.drone.pos.slice();
+  for (let i = 0; i < (CRASH.hold - 0.05) * 120; i++) step(sim, 1 / 120);
+  assert.ok(v3.len(v3.sub(sim.drone.pos, at)) < 0.05, 'moved during the respawn hold');
+  for (let i = 0; i < 120; i++) step(sim, 1 / 120);
+  assert.ok(v3.len(sim.drone.vel) > 5, 'flies again after the hold');
+});
+
+test('crash: you respawn just past the last gate you passed, never further on', () => {
+  const sim = makeSim({ seed: 3, pilot: 'manual', optimise: false });
+  for (let i = 0; i < 40 * 120 && sim.state.gatesPassed < 3; i++) {
+    sim.stick = botSticks(sim);
+    step(sim, 1 / 120);
+  }
+  assert.equal(sim.state.gatesPassed, 3);
+  ramTopBar(sim, sim.course.gates[5]); // a gate well ahead of the next one
+  for (let i = 0; i < 6 * 120 && sim.events.at(-1).type !== 'respawn'; i++) step(sim, 1 / 120);
+  assert.equal(sim.events.at(-1).type, 'respawn');
+  assert.equal(sim.state.target, 3);
+  const { plan } = sim, N = plan.pts.length;
+  const q = plan.pts[Math.round((plan.gateS[2] + CRASH.after) / plan.ds) % N];
+  assert.ok(Math.hypot(sim.drone.pos[0] - q.p[0], sim.drone.pos[2] - q.p[2]) < 1e-9);
+  // and it can carry on and finish the lap from there
+  sim.assist = true;
+  for (let i = 0; i < 40 * 120 && sim.state.laps.length < 1; i++) {
+    sim.stick = botSticks(sim);
+    step(sim, 1 / 120);
+  }
+  assert.equal(sim.state.laps.length, 1);
+});
+
+test('crash: a gentle touch slides along instead of crashing', () => {
+  const sim = makeSim({ seed: 5, pilot: 'manual', optimise: false });
+  const g = sim.course.gates.reduce((a, b) => (b.pos[1] > a.pos[1] ? b : a));
+  const barBottom = onGate(g, 0, -(S / 2 + T));
+  assert.ok(barBottom[1] > 3, 'need a high gate');
+  sim.drone.pos = [barBottom[0], barBottom[1] - 1.5, barBottom[2]];
+  sim.stick = { x: 0, y: 0, z: 0.15, s: 0 }; // climb at about 1 m/s into the bottom bar
+  for (let i = 0; i < 4 * 120; i++) step(sim, 1 / 120);
+  assert.equal(sim.state.crashes, 0);
+  assert.equal(sim.crash, null);
+  assert.ok(Math.abs(sim.drone.pos[1] - (barBottom[1] - CRASH.radius)) < 0.05, `pressed up at ${sim.drone.pos[1].toFixed(2)} m`);
+});
+
+test('crashes: map-only flies through frames, and crash flights are deterministic', () => {
+  assert.equal(makeSim({ seed: 1, nav: 'blind' }).crashes, false);
+  assert.equal(makeSim({ seed: 1, nav: 'vision' }).crashes, true);
+  const fly = () => {
+    const sim = makeSim({ seed: 2, pilot: 'manual', optimise: false });
+    ramTopBar(sim, sim.course.gates[0]);
+    for (let i = 0; i < 5 * 120; i++) step(sim, 1 / 120);
+    return sim;
+  };
+  const a = fly(), b = fly();
+  assert.equal(a.state.crashes, 1);
+  assert.deepEqual(a.drone.pos, b.drone.pos);
 });
