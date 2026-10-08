@@ -23,7 +23,8 @@ A rough backlog, not a contract. Each night picks the item that will make the bi
 ## Racing
 - [x] **Ghost replay** of the best lap: a gold ghost flies the best lap so far in step with the current lap, with a live gap at each gate; yours are saved per course in the browser (2026-10-07).
   - **Next steps:** a faint gold trail behind the ghost; share a ghost in the URL (or a short code) so a friend can race your lap; let the cyan rival and the gold ghost trade places on a toggle; a "clear my ghost" button.
-- [ ] **Multiple drones** racing with different controllers or tunings, and a live leaderboard.
+- [x] **Multiple drones**: a Field button races five autopilots with different controllers and tunings (racing line, vision, smooth, steady, pursuit) from a line-abreast grid, with an F1-style timing tower, name tags, lead-change toasts and tap-to-follow cameras. With Pilot: you, you race all of them (2026-10-08).
+  - **Next steps:** drone-to-drone contact (today they fly through each other like ghosts; even a simple sphere check with a bounce would make starts and overtakes look real) and racing-line planners that pick an overtaking line; airframe differences (thrust, drag) as well as tunings; a race length with a chequered flag and a results card; per-drone coloured trails; a field-wide telemetry view (speed traces of everyone on one chart).
 - [x] **Manual flight**: keyboard, gamepad and touch sticks in an assisted velocity mode, racing the live racing-line autopilot as a cyan ghost, with countdown, live gap, lap-vs-rival toasts and per-course personal bests (2026-10-05).
   - **Next steps:** a "rate"/acro mode for experienced pilots (sticks command tilt, no assists); ~~a ghost of *your* best lap~~ (done with Ghost replay, 2026-10-07); a short in-game tutorial lap; haptics on gate pass for phones; an assist slider (altitude assist off, lower top speed for beginners).
 

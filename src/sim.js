@@ -1050,16 +1050,23 @@ export const PILOTS = ['racing', 'pursuit', 'manual'];
 // nav: 'truth' flies from the true gate positions; 'vision' starts from a map with every
 // gate moved and corrects it with the camera; 'blind' trusts the map and nothing else.
 // wind: 'off', 'breezy' or 'gusty'; observer: whether the pilot estimates and cancels it.
-export function makeSim({ seed = 1, gates, pilot = 'racing', difficulty = 'normal', nav = 'truth', optimise = true, wind = 'off', observer = true, launchAt = null, crashes } = {}) {
+// tune: overrides for the racing line's planner and tracker (RACING keys), so a field of
+// drones can fly with different tunings. slot: grid slot for a line-abreast start (0 is on
+// the line, then alternately left and right, GRID.spacing apart).
+export const GRID = { spacing: 2.2 };
+export function gridOffset(slot) {
+  return slot ? (slot % 2 ? -1 : 1) * Math.ceil(slot / 2) * GRID.spacing : 0;
+}
+export function makeSim({ seed = 1, gates, pilot = 'racing', difficulty = 'normal', nav = 'truth', optimise = true, wind = 'off', observer = true, launchAt = null, crashes, tune = null, slot = 0 } = {}) {
   const course = makeCourse({ seed, gates, difficulty });
   if (!NAV_MODES.includes(nav)) nav = 'truth';
   const belief = nav === 'truth' ? null : makeMap(course, seed);
   const drone = makeDrone(course);
   // the racing pilot flies an optimised line; vision keeps its shape through re-plans
   if (!WIND_MODES.includes(wind)) wind = 'off';
-  const planOpts = windMargins(wind);
+  const planOpts = { ...windMargins(wind), ...tune };
   const shape = pilot === 'racing' && optimise
-    ? optimiseLine(belief ?? course, `${difficulty}/${seed}/${gates}/${nav !== 'truth'}/${wind}`, { plan: planOpts })
+    ? optimiseLine(belief ?? course, `${difficulty}/${seed}/${gates}/${nav !== 'truth'}/${wind}${tune ? '/' + JSON.stringify(tune) : ''}`, { plan: planOpts })
     : null;
   const plan = planRacingLine(belief ?? course, { ...planOpts, shape });
   if (course.difficulty !== 'normal') {
@@ -1072,6 +1079,12 @@ export function makeSim({ seed = 1, gates, pilot = 'racing', difficulty = 'norma
     const q = plan.pts[(Math.round((G0 - Math.min(18, leg - 4)) / plan.ds) + N) % N];
     drone.pos = [q.p[0], Math.max(1.5, q.p[1]), q.p[2]];
     drone.yaw = Math.atan2(q.t[0], q.t[2]);
+  }
+  const side = gridOffset(slot);
+  if (side) {
+    // line abreast: shift sideways, square to the start heading
+    drone.pos[0] += Math.cos(drone.yaw) * side;
+    drone.pos[2] -= Math.sin(drone.yaw) * side;
   }
   return {
     // map-only flies through frames like a ghost run, so you can watch every miss
@@ -1129,10 +1142,13 @@ export function step(sim, dt) {
   const air = sim.wind ? v3.sub(drone.vel, sim.wind.now) : drone.vel; // air-relative velocity
   const acc = v3.sub(v3.sub(drone.thrust, [0, G, 0]), v3.scale(air, DRONE.drag));
   const prev = drone.pos, vPrev = drone.vel;
-  drone.vel = v3.add(drone.vel, v3.scale(acc, dt));
+  // on the pad before the start, the drone is held still: wind can't push it off its
+  // grid slot (or into a gate) during a countdown
+  const onPad = sim.t < sim.launchAt;
+  drone.vel = onPad ? [0, 0, 0] : v3.add(drone.vel, v3.scale(acc, dt));
   drone.pos = v3.add(drone.pos, v3.scale(drone.vel, dt));
 
-  let grounded = false;
+  let grounded = onPad;
   if (drone.pos[1] < 0.15) {
     drone.pos[1] = 0.15;
     if (drone.vel[1] < 0) drone.vel[1] = 0;

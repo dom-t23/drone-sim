@@ -4,8 +4,9 @@ import assert from 'node:assert/strict';
 import {
   makeSim, step, planRacingLine, makeCourse, v3, GATE_INNER, DRONE, G, DIFFICULTIES,
   cameraPose, project, gateCorners, solveGatePose, CAMERA, optimiseLine, SHAPING, WIND,
-  MANUAL, headingAxes, CRASH, FRAME, collide, makeScenery,
+  MANUAL, headingAxes, CRASH, FRAME, collide, makeScenery, gridOffset, GRID,
 } from '../src/sim.js';
+import { ROSTER, rosterFor, makeField, syncField, standings, gapText } from '../src/field.js';
 import { makeRace, syncRace, raceGap } from '../src/race.js';
 import { makeSplits, splitsOnEvent } from '../src/splits.js';
 import { GHOST, makeGhostRecorder, recordGhost, ghostPose, ghostGap, encodeGhost, decodeGhost } from '../src/ghost.js';
@@ -802,4 +803,104 @@ test('ghost: survives a save and load, rejects junk, and replays a crash tumble'
   for (; fake.t < 1; fake.t += 0.01) recordGhost(r2, fake);
   const q = ghostPose({ ...r2.cur, time: 1 }, 0.5);
   assert.ok(q.tumble && Math.abs(q.tumble.angle - 1.2) < 1e-9 && q.tumble.axis[2] === 1);
+});
+
+// ---------- multi-drone races (2026-10-08) ----------
+
+test('field: the timing tower orders by gates passed, then who got there first, and shows gaps and lapped drones', () => {
+  const fake = (times, laps = []) => ({
+    events: times.map((t) => ({ t, type: 'gate' })), crash: null,
+    state: { lap: 1, laps },
+  });
+  const f = makeField([
+    { id: 'a', name: 'A', sim: fake([1, 2, 3]) },
+    { id: 'b', name: 'B', sim: fake([1.2, 2.5, 3.1], [9.9]) },
+    { id: 'c', name: 'C', sim: fake([1.5, 4], [9.5]) },
+    { id: 'd', name: 'D', sim: fake([]) },
+  ]);
+  syncField(f);
+  let rows = standings(f, 4);
+  assert.deepEqual(rows.map((r) => r.id), ['a', 'b', 'c', 'd']);
+  assert.equal(rows[0].gap, null);
+  assert.ok(Math.abs(rows[1].gap - 0.1) < 1e-9); // B reached gate 3 at 3.1, A at 3
+  assert.ok(Math.abs(rows[2].gap - 2) < 1e-9); // C reached gate 2 at 4, A at 2
+  assert.equal(rows[3].gap, null);
+  assert.equal(gapText(rows[1]), '+0.10');
+  assert.equal(gapText(rows[3]), '');
+  assert.equal(rows[2].fastest, true);
+  assert.equal(rows[1].fastest, false);
+  // A pulls a lap and more on C: C is shown as lapped, not with a huge time gap
+  f.entries[0].sim.events.push(...[5, 6, 7, 8, 9, 10].map((t) => ({ t, type: 'gate' })));
+  syncField(f);
+  rows = standings(f, 4);
+  const c = rows.find((r) => r.id === 'c');
+  assert.equal(c.lapped, 1);
+  assert.equal(gapText(c), '+1 lap');
+  // syncing twice adds nothing
+  syncField(f);
+  assert.equal(f.entries[0].times.length, 9);
+});
+
+test('field: grid slots are line abreast, alternately left and right, and nobody races its own twin', () => {
+  assert.deepEqual([0, 1, 2, 3, 4].map(gridOffset), [0, -GRID.spacing, GRID.spacing, -2 * GRID.spacing, 2 * GRID.spacing]);
+  const a = makeSim({ seed: 3 }), b = makeSim({ seed: 3, slot: 2 });
+  const fwd = [Math.sin(a.drone.yaw), 0, Math.cos(a.drone.yaw)], d = v3.sub(b.drone.pos, a.drone.pos);
+  assert.ok(Math.abs(v3.len(d) - GRID.spacing) < 1e-9 && Math.abs(v3.dot(d, fwd)) < 1e-9);
+  assert.deepEqual(rosterFor({ pilot: 'racing', nav: 'truth' }).map((r) => r.id), ['vision', 'smooth', 'steady', 'pursuit']);
+  assert.deepEqual(rosterFor({ pilot: 'pursuit', nav: 'truth' }).map((r) => r.id), ['line', 'vision', 'smooth', 'steady']);
+  assert.equal(rosterFor({ pilot: 'manual', nav: 'truth' }).length, ROSTER.length);
+  assert.equal(new Set(ROSTER.map((r) => r.color)).size, ROSTER.length);
+});
+
+for (const difficulty of DIFFICULTIES) {
+  test(`field: the whole roster races ${difficulty} courses from a line-abreast grid without crashing, in a clear order`, () => {
+    for (const seed of [1, 4]) {
+      const sims = ROSTER.map((r, k) => makeSim({ seed, difficulty, ...r.opts, slot: k, launchAt: 3 }));
+      const field = makeField(ROSTER.map((r, k) => ({ id: r.id, name: r.name, sim: sims[k] })));
+      const n = sims[0].course.gates.length;
+      const seconds = difficulty === 'hard' ? 70 : 45; // long enough for pursuit to be lapped
+      for (let i = 0; i < seconds * 120; i++) {
+        for (const s of sims) step(s, 1 / 120);
+        if (i % 12 === 0) syncField(field);
+      }
+      syncField(field);
+      const best = {};
+      ROSTER.forEach((r, k) => {
+        const st = sims[k].state;
+        assert.equal(st.crashes, 0, `${r.id} crashed on ${difficulty}/${seed}`);
+        if (r.opts.pilot === 'racing') assert.equal(st.misses, 0, `${r.id} missed a gate on ${difficulty}/${seed}`);
+        assert.ok(st.laps.length >= 1, `${r.id} finished no lap on ${difficulty}/${seed}`);
+        best[r.id] = Math.min(...st.laps);
+      });
+      // tunings really differ: the shaped line beats the gentle and the steady ones, and
+      // every racing-line entrant beats the original pursuit pilot by a distance
+      assert.ok(best.line < best.smooth - 0.3 && best.smooth < best.steady, JSON.stringify(best));
+      for (const id of ['line', 'vision', 'smooth', 'steady']) assert.ok(best[id] < best.pursuit - 4);
+      const rows = standings(field, n);
+      assert.equal(rows.at(-1).id, 'pursuit');
+      assert.ok(['line', 'vision'].includes(rows[0].id), rows[0].id);
+      assert.ok(rows.find((r) => r.id === 'pursuit').lapped >= 1, `pursuit should be lapped by ${seconds} s`);
+    }
+  });
+}
+
+test('field: a tuned sim is deterministic and its tuning reaches the planner and tracker', () => {
+  const a = makeSim({ seed: 5, tune: { turnMargin: 0.6, vMax: 26 }, slot: 3 });
+  const b = makeSim({ seed: 5, tune: { turnMargin: 0.6, vMax: 26 }, slot: 3 });
+  assert.equal(a.plan.params.turnMargin, 0.6);
+  assert.ok(Math.max(...a.plan.pts.map((q) => q.v)) <= 26 + 1e-9);
+  assert.ok(a.plan.lapTime > makeSim({ seed: 5 }).plan.lapTime + 1);
+  for (let i = 0; i < 20 * 120; i++) { step(a, 1 / 120); step(b, 1 / 120); }
+  assert.deepEqual(a.drone.pos, b.drone.pos);
+  assert.deepEqual(a.state.laps, b.state.laps);
+});
+
+test('field: in gusty wind the drone is held on its grid slot until the start, then flies off', () => {
+  const sim = makeSim({ seed: 2, wind: 'gusty', launchAt: 3, slot: 2 });
+  const start = sim.drone.pos.slice();
+  while (sim.t < 2.95) step(sim, 1 / 120);
+  assert.deepEqual(sim.drone.pos, start);
+  assert.ok(Math.hypot(...sim.wind.now) > 0.5, 'there should be wind to resist');
+  while (sim.t < 5) step(sim, 1 / 120);
+  assert.ok(v3.len(v3.sub(sim.drone.pos, start)) > 5);
 });

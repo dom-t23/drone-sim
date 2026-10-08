@@ -2,6 +2,16 @@
 
 Newest first. One entry per night's run.
 
+## 2026-10-08: Multi-drone races
+- **New Field button (or `F`): a five-drone race with a live timing tower.** The drone you're watching takes pole, and four more line up abreast beside it for a **3, 2, 1, GO!** start. Each is the same airframe on the same course in the same wind, flown by a different autopilot: **Racing line** (red, the optimised line), **Vision** (blue, the same line but it has to find the gates with its camera), **Smooth** (teal, an unshaped line, gentler on the throttle), **Steady** (purple, keeps 40% of its envelope in reserve in turns) and **Pursuit** (white, the original gate-axis chaser, which gets lapped). Floating name tags show who's who.
+- **The timing tower** (top left) works like F1 timing loops: position, gap to the leader at the last gate, `+1 lap` for lapped drones, and each drone's best lap with the fastest in purple. A toast calls each change of lead. Racing line and Vision are often within a tenth of a second, and on some hard courses Vision wins.
+- **Tap a name in the tower to follow that drone.** The chase and onboard cameras switch to it. Follow Vision with Camera: onboard to see its gate detections.
+- **With Pilot: you, you race the whole field** (six drones) instead of the single cyan ghost.
+- Links work too: `#seed=3&d=hard&field=1`.
+- **Fix:** before a start, the drone is now held still on the pad. In gusty wind the countdown used to let the wind push it off the start (and sometimes into a gate) before the race began.
+- How it works: `makeSim` takes a `tune` (overrides for the racing line's planner and tracker) and a grid `slot`, so the roster in `src/field.js` is just a list of sim recipes. The tower's ordering, gaps and lapping are pure logic in `src/field.js`, tested in Node. Every entrant is a full simulation stepped at 120 Hz, with its own planning, vision, wind and crashes.
+- Tests: the tower orders by gates then time, with the right gaps, lapped drones and fastest lap; grid slots are line abreast and nobody races its own twin; the whole roster races easy, normal and hard courses from the grid with no crashes (and no misses for the racing-line entrants), in a clear order: the shaped line beats Smooth, Smooth beats Steady, every racing-line entrant beats Pursuit by 4 s a lap or more, and Pursuit gets lapped; tuned sims are deterministic and their tuning really reaches the planner; and in gusty wind the drone stays on its slot until GO.
+
 ## 2026-10-07 (second run): Ghost replay
 - **A gold ghost flies your best lap.** Every lap is recorded, and from the second lap on a translucent gold drone replays the fastest one so far, in step with the lap you're on. It's easiest to see with **Pilot: you** (it's your own best lap, so you can chase it) or with **Nav: vision** and **Wind: gusty**, where laps differ. When the autopilot repeats a lap exactly, the ghost sits inside the drone and is hidden.
 - A new **Ghost** row in the stats shows the gap to the ghost at the last gate you passed: green `−0.31 s` when you're ahead, red `+0.42 s` when you're behind. Until there's a gate to compare, it shows the ghost's lap time.

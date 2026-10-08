@@ -3,6 +3,7 @@ import { makeSim, step, GATE_INNER, v3, DIFFICULTIES, NAV_MODES, WIND_MODES, PIL
 import { makeRace, syncRace, raceGap } from './race.js';
 import { makeGhostRecorder, recordGhost, ghostPose, encodeGhost, decodeGhost } from './ghost.js';
 import { makeTelemetry, resetTelemetry, sampleTelemetry, drawTelemetry } from './telemetry.js';
+import { ROSTER, rosterFor, makeField, syncField, standings, gapText } from './field.js';
 
 const DT = 1 / 120;
 const $ = (id) => document.getElementById(id);
@@ -60,6 +61,11 @@ let rival = null, race = null, pb = null;
 // ghost replay: a gold drone flying the best lap so far (yours are kept per course)
 let ghostRec = makeGhostRecorder(), ghostOn = true;
 const COUNTDOWN = 3; // s on the pad before a race starts
+// multi-drone race: a field of autopilots with different tunings, plus a timing tower.
+// field.entries[0] is always the hero (sim, the drone the HUD describes); followId picks
+// which drone the cameras follow.
+let fieldOn = false, field = null, followId = 'hero', lastLeader = null;
+const HERO_COLOR = '#ff8a3d';
 const telemetry = makeTelemetry($('telemetry'));
 scene.add(world);
 
@@ -131,13 +137,15 @@ function buildWorld() {
 
   const manual = pilot === 'manual';
   // you fly by eye, so your sim knows the true course; the rival uses the chosen nav mode
-  sim = makeSim({ seed, pilot, difficulty, nav: manual ? 'truth' : nav, wind: windMode, launchAt: manual ? COUNTDOWN : null, optimise: !manual });
-  rival = manual ? makeSim({ seed, pilot: 'racing', difficulty, nav, wind: windMode, launchAt: COUNTDOWN }) : null;
-  race = manual ? makeRace() : null;
+  sim = makeSim({ seed, pilot, difficulty, nav: manual ? 'truth' : nav, wind: windMode, launchAt: manual || fieldOn ? COUNTDOWN : null, optimise: !manual });
+  // a race against one rival, unless the whole field is racing
+  rival = manual && !fieldOn ? makeSim({ seed, pilot: 'racing', difficulty, nav, wind: windMode, launchAt: COUNTDOWN }) : null;
+  race = rival ? makeRace() : null;
   pb = manual ? loadPb() : null;
   ghostRec = makeGhostRecorder(manual ? loadGhost() : null);
   ghostMesh.visible = false;
-  rivalMesh.visible = manual;
+  rivalMesh.visible = !!rival;
+  buildField();
   $('countdown').hidden = true;
   $('pads').hidden = !(manual && coarse);
   writeHash();
@@ -258,6 +266,138 @@ ghostMesh.traverse((o) => {
 });
 ghostMesh.visible = false;
 scene.add(ghostMesh);
+
+// ---------- the field: one solid drone per entrant, nose and arms in its colour ----------
+const racerMeshes = new Map(); // roster id -> mesh, made on first use and reused
+function racerMesh(r) {
+  if (racerMeshes.has(r.id)) return racerMeshes.get(r.id);
+  const mesh = drone.clone(true);
+  const paint = new THREE.MeshStandardMaterial({ color: r.color, emissive: r.color, emissiveIntensity: 0.45 });
+  // children: body, nose, then (arm, prop) per rotor
+  mesh.children.forEach((c, i) => {
+    if (c.isMesh && (i === 1 || (i >= 2 && i % 2 === 0))) c.material = paint;
+    if (c.isMesh) c.castShadow = false;
+  });
+  mesh.visible = false;
+  scene.add(mesh);
+  racerMeshes.set(r.id, mesh);
+  return mesh;
+}
+// name tag floating over a drone
+function makeLabel(text, color) {
+  const cv = document.createElement('canvas');
+  cv.width = 256; cv.height = 64;
+  const c = cv.getContext('2d');
+  c.font = '600 30px ui-sans-serif, system-ui, sans-serif';
+  const w = Math.min(248, c.measureText(text).width + 52);
+  c.fillStyle = 'rgba(11, 18, 32, 0.72)';
+  c.beginPath();
+  if (c.roundRect) c.roundRect((256 - w) / 2, 8, w, 48, 24);
+  else c.rect((256 - w) / 2, 8, w, 48);
+  c.fill();
+  c.fillStyle = color;
+  c.beginPath();
+  c.arc((256 - w) / 2 + 24, 32, 9, 0, Math.PI * 2);
+  c.fill();
+  c.fillStyle = '#e8edf5';
+  c.textBaseline = 'middle';
+  c.fillText(text, (256 - w) / 2 + 42, 33, w - 50);
+  const tex = new THREE.CanvasTexture(cv);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  // fixed size on screen (no size attenuation), so tags stay readable far away and small up close
+  const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, depthTest: false, transparent: true, sizeAttenuation: false }));
+  sprite.scale.set(0.15, 0.0375, 1);
+  sprite.renderOrder = 20;
+  return sprite;
+}
+function heroName() {
+  if (pilot === 'manual') return 'You';
+  const twin = ROSTER.find((r) => r.opts.pilot === pilot && r.opts.nav === nav && !r.opts.tune && r.opts.optimise !== false);
+  if (twin) return twin.name;
+  if (pilot === 'racing' && nav === 'blind') return 'Map only';
+  return PILOT_LABELS[pilot][0].toUpperCase() + PILOT_LABELS[pilot].slice(1) + (nav === 'truth' ? '' : ` · ${NAV_LABELS[nav]}`);
+}
+function clearField() {
+  for (const e of field?.entries ?? []) {
+    if (e.id !== 'hero') e.mesh.visible = false;
+    scene.remove(e.label);
+    e.label.material.map.dispose();
+    e.label.material.dispose();
+  }
+  field = null;
+}
+function buildField() {
+  clearField();
+  setFollow('hero');
+  lastLeader = null;
+  $('board').hidden = !fieldOn;
+  if (!fieldOn) return;
+  const entries = [{ id: 'hero', name: heroName(), color: HERO_COLOR, sim, mesh: drone }];
+  // the hero takes pole, on the line; the rest line up abreast, alternately left and right
+  rosterFor({ pilot, nav }).forEach((r, k) => {
+    const s = makeSim({ seed, difficulty, wind: windMode, ...r.opts, slot: k + 1, launchAt: COUNTDOWN });
+    entries.push({ id: r.id, name: r.name, color: r.color, sim: s, mesh: racerMesh(r) });
+  });
+  for (const e of entries) {
+    e.label = makeLabel(e.name, e.color);
+    scene.add(e.label);
+    if (e.id !== 'hero') {
+      e.mesh.visible = true;
+      syncMesh(e.mesh, e.sim.drone);
+    }
+  }
+  field = makeField(entries);
+  boardHtml = '';
+}
+const viewEntry = () => field?.entries.find((e) => e.id === followId) ?? null;
+const viewSim = () => viewEntry()?.sim ?? sim;
+const viewMesh = () => viewEntry()?.mesh ?? drone;
+// the cameras (chase and onboard) follow the chosen drone
+function setFollow(id) {
+  followId = id;
+  viewMesh().add(camMount);
+}
+function updateField() {
+  syncField(field);
+  for (const e of field.entries) {
+    if (e.id !== 'hero') syncMesh(e.mesh, e.sim.drone);
+    const p = e.sim.drone.pos;
+    e.label.position.set(p[0], p[1] + 1.1, p[2]);
+    e.label.visible = e.id !== followId || camMode === 'orbit';
+  }
+  if (frameNo % 6 === 0) updateBoard();
+}
+// the timing tower, F1 style: position, name, gap to the leader, best lap (fastest in purple)
+let boardHtml = '';
+const esc = (t) => t.replace(/[&<>"]/g, (ch) => `&#${ch.charCodeAt(0)};`);
+function updateBoard() {
+  const n = sim.course.gates.length;
+  const rows = standings(field, n);
+  const lead = rows[0];
+  if (lead.gates && lead.id !== lastLeader) {
+    if (lastLeader !== null) toast(`${lead.name} takes the lead`);
+    lastLeader = lead.id;
+  }
+  const color = Object.fromEntries(field.entries.map((e) => [e.id, e.color]));
+  const lap = Math.max(1, ...rows.map((r) => r.lap));
+  const html = `<div class="board-head"><span>Race · lap ${lap}</span><small>tap to follow</small></div>` + rows.map((r) => {
+    const cls = [r.id === followId && 'cam', r.id === 'hero' && 'hero'].filter(Boolean).join(' ');
+    const gap = r.pos === 1 ? (r.gates ? 'Leader' : '') : gapText(r);
+    return `<div class="row ${cls}" data-id="${r.id}"><i>${r.pos}</i><span class="dot" style="background:${color[r.id]}"></span>`
+      + `<span class="nm">${esc(r.name)}${r.crashed ? ' <em class="out">crash</em>' : ''}</span><b>${gap}</b>`
+      + `<em class="${r.fastest ? 'fl' : ''}">${r.best == null ? '' : r.best.toFixed(2)}</em></div>`;
+  }).join('');
+  if (html !== boardHtml) $('board').innerHTML = boardHtml = html;
+}
+$('board').addEventListener('click', (e) => {
+  const row = e.target.closest('.row');
+  if (!row || !field) return;
+  setFollow(row.dataset.id);
+  boardHtml = '';
+  updateBoard();
+  const who = viewEntry();
+  if (who) toast(who.id === 'hero' ? 'Following you' : `Following ${who.name}`);
+});
 // Fly the ghost to where the best lap was at this point in the current lap. Hidden when
 // it sits right on top of the drone (a repeatable autopilot lap matches itself).
 function updateGhost() {
@@ -340,7 +480,7 @@ for (let i = 0; i < STREAKS; i++) streakSeed.push([Math.random(), Math.random(),
 function updateStreaks(dtSim) {
   streaks.visible = !!sim.wind;
   if (!sim.wind) return;
-  const w = sim.wind.now, c = sim.drone.pos, half = STREAK_BOX / 2;
+  const w = sim.wind.now, c = viewSim().drone.pos, half = STREAK_BOX / 2;
   const len = 0.12; // s of travel each dash shows
   for (let i = 0; i < STREAKS; i++) {
     const p = streakSeed[i];
@@ -406,7 +546,7 @@ function updateHud(force) {
   if (force) return;
   for (; lastEvents < sim.events.length; lastEvents++) {
     const e = sim.events[lastEvents];
-    if (e.type === 'lap') toast(race ? lapToast(e.time) : `Lap ${fmt(e.time)}`);
+    if (e.type === 'lap') toast(pilot === 'manual' ? lapToast(e.time) : `Lap ${fmt(e.time)}`);
     if (e.type === 'gate') onGate(e.gate);
     if (e.type === 'miss') toast(`Missed gate ${e.gate + 1}`, true);
     if (e.type === 'crash') {
@@ -425,7 +565,7 @@ function onGate(id) {
 }
 // Your lap in a race: against the rival's best, and your personal best on this course.
 function lapToast(t) {
-  const rb = rival.state.laps.length ? Math.min(...rival.state.laps) : null;
+  const rb = rival?.state.laps.length ? Math.min(...rival.state.laps) : null;
   const vs = rb == null ? '' : ` · rival ${rb.toFixed(2)}`;
   if (pb == null || t < pb) {
     const first = pb == null;
@@ -470,13 +610,19 @@ const NAV_NOTES = {
   blind: '<b>Map only.</b> The drone trusts a map with every gate up to 2.6 m out (cyan), so it misses gates. As a ghost run, it flies straight through any frame it meets.',
 };
 const coarse = matchMedia('(pointer: coarse)').matches;
-const MANUAL_NOTE = coarse
-  ? '<b>You fly.</b> Left stick: speed and turn. Right stick: climb and drift (height is held for you). Beat the cyan ghost: it\'s the autopilot. The gold ghost is your best lap.'
-  : '<b>You fly.</b> <b>W</b>/<b>↑</b> speed, <b>A D</b>/<b>← →</b> turn, <b>Space</b>/<b>Shift</b> climb (height is held for you). Gamepads work too. Beat the cyan ghost: it\'s the autopilot. The gold ghost is your best lap.';
+const MANUAL_CONTROLS = coarse
+  ? '<b>You fly.</b> Left stick: speed and turn. Right stick: climb and drift (height is held for you).'
+  : '<b>You fly.</b> <b>W</b>/<b>↑</b> speed, <b>A D</b>/<b>← →</b> turn, <b>Space</b>/<b>Shift</b> climb (height is held for you). Gamepads work too.';
+const MANUAL_NOTE = `${MANUAL_CONTROLS} Beat the cyan ghost: it's the autopilot. The gold ghost is your best lap.`;
+function fieldNote() {
+  const names = field.entries.filter((e) => e.id !== 'hero').map((e) => `<b style="color:${e.color}">${esc(e.name)}</b>`);
+  const head = pilot === 'manual' ? `${MANUAL_CONTROLS} ` : '<b>Field.</b> ';
+  return `${head}You're racing ${names.slice(0, -1).join(', ')} and ${names.at(-1)}: the same drone with different autopilots. Tap a name in the tower to follow it.`;
+}
 let noteTimer;
 function showNavNote() {
   const el = $('nav-note');
-  const html = pilot === 'manual' ? MANUAL_NOTE : NAV_NOTES[nav];
+  const html = field ? fieldNote() : pilot === 'manual' ? MANUAL_NOTE : NAV_NOTES[nav];
   el.innerHTML = html ?? '';
   el.hidden = !html;
   el.classList.remove('fade');
@@ -533,8 +679,15 @@ function syncButtons() {
   $('b-nav').textContent = `Nav: ${NAV_LABELS[nav]}`;
   $('b-wind').textContent = `Wind: ${windMode}`;
   $('b-pilot').textContent = `Pilot: ${PILOT_LABELS[pilot]}`;
+  $('b-field').textContent = fieldOn ? `Field: ${1 + rosterFor({ pilot, nav }).length} drones` : 'Field: solo';
+  $('b-field').classList.toggle('on', fieldOn);
 }
 const PILOT_LABELS = { racing: 'racing line', pursuit: 'pursuit', manual: 'you' };
+$('b-field').onclick = () => {
+  fieldOn = !fieldOn;
+  syncButtons();
+  buildWorld();
+};
 
 // ---------- shareable course in the URL: #seed=12&d=hard&nav=vision ----------
 function readHash() {
@@ -545,14 +698,15 @@ function readHash() {
   nav = NAV_MODES.includes(p.get('nav')) ? p.get('nav') : 'truth';
   windMode = WIND_MODES.includes(p.get('wind')) ? p.get('wind') : 'off';
   pilot = PILOTS.includes(p.get('pilot')) ? p.get('pilot') : 'racing';
+  fieldOn = p.get('field') === '1';
   syncButtons();
 }
 function writeHash() {
-  const h = `#seed=${seed}&d=${difficulty}${nav === 'truth' ? '' : `&nav=${nav}`}${windMode === 'off' ? '' : `&wind=${windMode}`}${pilot === 'racing' ? '' : `&pilot=${pilot}`}`;
+  const h = `#seed=${seed}&d=${difficulty}${nav === 'truth' ? '' : `&nav=${nav}`}${windMode === 'off' ? '' : `&wind=${windMode}`}${pilot === 'racing' ? '' : `&pilot=${pilot}`}${fieldOn ? '&field=1' : ''}`;
   if (location.hash !== h) history.replaceState(null, '', h);
 }
 addEventListener('hashchange', () => {
-  const key = () => `${seed}/${difficulty}/${nav}/${windMode}/${pilot}`;
+  const key = () => `${seed}/${difficulty}/${nav}/${windMode}/${pilot}/${fieldOn}`;
   const before = key();
   readHash();
   if (key() !== before) buildWorld();
@@ -637,6 +791,7 @@ addEventListener('keydown', (e) => {
   if (e.key === 'w') $('b-wind').click();
   if (e.key === 't') $('b-tm').click();
   if (e.key === 'g') $('b-ghost').click();
+  if (e.key === 'f') $('b-field').click();
 });
 
 // ---------- onboard overlay: what the camera detected this frame ----------
@@ -658,7 +813,7 @@ function toScreen(p, rect) {
   return [rect.x + ((ovV.x + 1) / 2) * rect.w, rect.top + ((1 - ovV.y) / 2) * rect.h];
 }
 function drawOverlay(rect, label) {
-  const frame = sim.vision?.frame;
+  const vs = viewSim(), frame = vs.vision?.frame;
   if (!frame && !overlayDrawn) return;
   octx.setTransform(1, 0, 0, 1, 0, 0);
   octx.clearRect(0, 0, overlay.width, overlay.height);
@@ -671,7 +826,7 @@ function drawOverlay(rect, label) {
   octx.clip();
   octx.lineWidth = 1.5;
   let found = 0;
-  const fresh = sim.t - frame.t < 0.2;
+  const fresh = vs.t - frame.t < 0.2;
   for (const det of fresh ? frame.dets : []) {
     const pts = det.world.map((p) => toScreen(p, rect));
     if (pts.some((q) => !q)) continue;
@@ -729,7 +884,7 @@ function updateCountdown() {
 }
 
 function updateCameras(dtFrame) {
-  const d = sim.drone;
+  const d = viewSim().drone;
   const k = 1 - Math.exp(-dtFrame * 3.5);
   if (camMode === 'chase') {
     const back = new THREE.Vector3(-Math.sin(d.yaw), 0, -Math.cos(d.yaw));
@@ -757,6 +912,7 @@ function frame(now) {
     step(sim, DT);
     if (recordGhost(ghostRec, sim) && pilot === 'manual') saveGhost(ghostRec.best);
     if (rival) step(rival, DT);
+    if (field) for (const e of field.entries) if (e.sim !== sim) step(e.sim, DT);
     sampleTelemetry(telemetry, sim);
     acc -= DT;
     if (++steps % 6 === 0) pushTrail(sim.drone.pos);
@@ -766,8 +922,9 @@ function frame(now) {
   if (rival) {
     syncRace(race, sim, rival);
     syncMesh(rivalMesh, rival.drone);
-    updateCountdown();
   }
+  if (field) updateField();
+  if (rival || field) updateCountdown();
   updateGhost();
   updateStreaks(steps * DT);
   updateDebris(steps * DT);
@@ -788,9 +945,10 @@ function frame(now) {
   if (camMode === 'fpv') {
     fpvCam.aspect = W / H;
     fpvCam.updateProjectionMatrix();
-    drone.visible = false;
+    const vm = viewMesh();
+    vm.visible = false;
     renderer.render(scene, fpvCam);
-    drone.visible = true;
+    vm.visible = true;
     drawOverlay({ x: 0, top: 0, w: W, h: H }, W >= 700 ? { x: W / 2 - 56, y: 16 } : null);
     $('fpv-label').style.display = 'none';
   } else {
@@ -804,9 +962,10 @@ function frame(now) {
     renderer.setScissorTest(true);
     renderer.setScissor(x, y, w, h);
     renderer.setViewport(x, y, w, h);
-    drone.visible = false;
+    const vm = viewMesh();
+    vm.visible = false;
     renderer.render(scene, fpvCam);
-    drone.visible = true;
+    vm.visible = true;
     drawOverlay({ x, top: H - y - h, w, h }, w >= 180 ? { x: x + 6, y: H - y - h + 6 } : null);
     const lbl = $('fpv-label');
     lbl.style.display = 'block';
