@@ -9,6 +9,7 @@ import {
 import { ROSTER, rosterFor, makeField, syncField, standings, gapText } from '../src/field.js';
 import { makeRace, syncRace, raceGap } from '../src/race.js';
 import { makeSplits, splitsOnEvent } from '../src/splits.js';
+import { ROTOR, WASH, rotorSpeed, inducedVelocity, motorTone, makeWash, emitWash, stepWash } from '../src/fx.js';
 import { GHOST, makeGhostRecorder, recordGhost, ghostPose, ghostGap, encodeGhost, decodeGhost } from '../src/ghost.js';
 
 const SEEDS = [1, 2, 3, 4, 5, 7, 11, 42];
@@ -903,4 +904,87 @@ test('field: in gusty wind the drone is held on its grid slot until the start, t
   assert.ok(Math.hypot(...sim.wind.now) > 0.5, 'there should be wind to resist');
   while (sim.t < 5) step(sim, 1 / 120);
   assert.ok(v3.len(v3.sub(sim.drone.pos, start)) > 5);
+});
+
+// ---------- effects: rotor physics for the motor sound and the prop wash ----------
+
+const hover = (pos = [0, 2, 0], extra = {}) => ({ pos, vel: [0, 0, 0], thrust: [0, G, 0], yaw: 0, ...extra });
+function seeded(seed) { let s = seed >>> 0; return () => ((s = (s * 1664525 + 1013904223) >>> 0) / 2 ** 32); }
+
+test('fx: induced velocity follows momentum theory (about 7 m/s at hover, growing as the root of thrust)', () => {
+  const v0 = inducedVelocity(hover());
+  assert.ok(v0 > 6 && v0 < 8.5, `hover induced velocity ${v0.toFixed(2)} m/s`);
+  const full = inducedVelocity(hover(undefined, { thrust: [0, DRONE.maxThrustAcc, 0] }));
+  assert.ok(Math.abs(full / v0 - Math.sqrt(DRONE.maxThrustAcc / G)) < 1e-9);
+  // beyond the airframe's limit is clamped
+  assert.equal(inducedVelocity(hover(undefined, { thrust: [0, 100, 0] })), full);
+});
+
+test('fx: motor tone sits at the hover pitch in a hover, rises with thrust, and cuts out in a crash', () => {
+  const h = motorTone(hover());
+  assert.ok(Math.abs(h.freq - ROTOR.hoverHz) < 1e-9);
+  assert.equal(h.air, 0);
+  const hard = motorTone(hover(undefined, { thrust: [10, 22, 0], vel: [20, 0, 0] }));
+  assert.ok(hard.freq > h.freq * 1.3 && hard.gain > h.gain, 'more thrust: higher and louder');
+  assert.ok(hard.air > 0.4 && hard.air <= 1);
+  assert.equal(motorTone(hover(undefined, { vel: [90, 0, 0] })).air, 1);
+  const c = motorTone(hover(), { crashed: true });
+  assert.equal(c.gain, 0);
+  assert.ok(c.freq < h.freq);
+  assert.ok(rotorSpeed(hover()) > 0 && rotorSpeed(hover()) < 1);
+});
+
+test('fx: prop wash from a low hover hits the ground and spreads outward as dust, never sinking through', () => {
+  const w = makeWash(), d = hover([5, 1.5, -3]), rand = seeded(1), dt = 1 / 60;
+  let emitted = 0, maxR = 0;
+  for (let i = 0; i < 120; i++) {
+    emitted += emitWash(w, d, dt, { scale: 2.2, rand });
+    stepWash(w, dt);
+    for (let k = 0; k < w.n; k++) {
+      if (w.age[k] >= WASH.life) continue;
+      assert.ok(w.pos[k * 3 + 1] >= WASH.floor - 1e-6, 'below the ground');
+      if (w.dust[k]) maxR = Math.max(maxR, Math.hypot(w.pos[k * 3] - 5, w.pos[k * 3 + 2] + 3));
+    }
+  }
+  assert.ok(Math.abs(emitted - WASH.rate * 2) <= 1, `emitted ${emitted} in 2 s`);
+  const dust = [...w.dust].filter((x, k) => x && w.age[k] < WASH.life).length;
+  assert.ok(dust > 20, `only ${dust} dust particles`);
+  assert.ok(maxR > 2.5, `dust ring only reached ${maxR.toFixed(2)} m`);
+});
+
+test('fx: no dust from high up, no wash at all in a crash, and a fast drone leaves its wash behind', () => {
+  const w = makeWash(), rand = seeded(2), dt = 1 / 60;
+  for (let i = 0; i < 90; i++) { emitWash(w, hover([0, 15, 0]), dt, { scale: 2.2, rand }); stepWash(w, dt); }
+  assert.equal([...w.dust].filter(Boolean).length, 0);
+  const c = makeWash();
+  for (let i = 0; i < 30; i++) assert.equal(emitWash(c, hover(), dt, { crashed: true }), 0);
+  assert.equal(stepWash(c, dt), 0);
+  // flying along +x at 20 m/s: the wash stays roughly where it was blown out, so it trails
+  const f = makeWash(), d = hover([0, 8, 0], { vel: [20, 0, 0] });
+  for (let i = 0; i < 30; i++) {
+    emitWash(f, d, dt, { scale: 2.2, rand });
+    stepWash(f, dt);
+    d.pos[0] += 20 * dt;
+  }
+  let behind = 0, live = 0;
+  for (let k = 0; k < f.n; k++) if (f.age[k] < WASH.life) { live++; if (f.pos[k * 3] < d.pos[0] - 1) behind++; }
+  assert.ok(behind / live > 0.7, `${behind}/${live} behind`);
+  // and a wind carries it downwind
+  const g = makeWash();
+  for (let i = 0; i < 30; i++) { emitWash(g, hover([0, 8, 0]), dt, { wind: [0, 0, 6], rand }); stepWash(g, dt); }
+  let sz = 0, n = 0;
+  for (let k = 0; k < g.n; k++) if (g.age[k] < WASH.life) { sz += g.pos[k * 3 + 2]; n++; }
+  assert.ok(sz / n > 0.5, 'drifts downwind');
+});
+
+test('fx: wash and motor tone stay finite through 40 s of gusty flight on a hard course', () => {
+  const sim = makeSim({ seed: 3, pilot: 'pursuit', difficulty: 'hard', wind: 'gusty' }), w = makeWash(), rand = seeded(3), dt = 1 / 120;
+  for (let i = 0; i < 120 * 40; i++) {
+    step(sim, dt);
+    emitWash(w, sim.drone, dt, { crashed: !!sim.crash, scale: 2.2, wind: sim.wind?.now, rand });
+    assert.ok(stepWash(w, dt) <= w.n);
+    const t = motorTone(sim.drone, { crashed: !!sim.crash });
+    assert.ok([t.freq, t.gain, t.air].every(Number.isFinite));
+  }
+  assert.ok([...w.pos].every(Number.isFinite) && [...w.vel].every(Number.isFinite));
 });

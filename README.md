@@ -19,17 +19,19 @@ This is an experiment in what Claude can build on its own. A scheduled Claude ru
 | **Wind** (or `W`) | Off → breezy → gusty |
 | **Telemetry** (or `T`) | Live charts and gate splits |
 | **Ghost** (or `G`) | Show or hide the gold ghost of the best lap |
+| **Night** (or `L`) | Day ↔ night: LED-lit gates, stars and a headlight |
+| **Sound** (or `M`) | Motor sound and race cues on or off |
 | **New course** (or `N`) | Generate a new gate layout |
 | **Share** | Copy a link to this exact course |
 
 **Flying it yourself** (Pilot: you): `W`/`↑` speed, `A` `D`/`←` `→` turn, `Space`/`Shift` (or `E`/`Q`) climb and descend. On phones, on-screen sticks appear (left: speed and turn; right: climb and drift); gamepads work too. You race the racing-line autopilot, shown as a cyan ghost, and your own best lap on that course, shown as a gold ghost (kept in your browser).
 
-The course is in the URL, e.g. https://dom-t23.github.io/drone-sim/#seed=12&d=hard (add `&nav=vision` for vision mode, `&wind=gusty` for wind, `&pilot=manual` to race it yourself, `&field=1` for a multi-drone race), so any layout can be shared or revisited.
+The course is in the URL, e.g. https://dom-t23.github.io/drone-sim/#seed=12&d=hard (add `&nav=vision` for vision mode, `&wind=gusty` for wind, `&pilot=manual` to race it yourself, `&field=1` for a multi-drone race, `&night=1` for night mode), so any layout can be shared or revisited.
 
 ## How it works
 
 - `src/sim.js` is the simulation core with no rendering dependencies: course generation (three difficulties; hard adds big climbs, angled gates and dive gates), quadrotor dynamics (thrust vector with tilt and thrust limits, first-order lag, drag), the racing-line planner, both autopilots, the assisted manual pilot, gate/lap detection, collisions with gate frames, legs and pillars (crash, tumble and respawn), and vision mode (camera model, PnP, gating and fusion, in-flight re-planning).
-- `src/main.js` renders it with three.js and runs the sim at a fixed 120 Hz timestep; `src/telemetry.js` draws the telemetry panel, `src/splits.js` works out gate splits, `src/race.js` the gap to the rival when you race it, `src/field.js` the multi-drone roster and timing tower, and `src/ghost.js` records the best lap and replays it.
+- `src/main.js` renders it with three.js and runs the sim at a fixed 120 Hz timestep; `src/telemetry.js` draws the telemetry panel, `src/splits.js` works out gate splits, `src/race.js` the gap to the rival when you race it, `src/field.js` the multi-drone roster and timing tower, `src/ghost.js` records the best lap and replays it, `src/fx.js` holds the rotor physics behind the prop wash and motor sound, and `src/audio.js` synthesises the sound with Web Audio.
 - `test/` holds headless checks run with `npm test` (Node 18+). They fly a set of course seeds on every difficulty and nav mode and fail if the drone misses gates, crashes, strays from its line, gets slower, mis-estimates gates, or the state goes non-finite.
 
 The default autopilot flies a **racing line**: a smooth closed spline through every gate, crossing each one square-on. Where it crosses each opening (up to 0.6 m off centre) and how hard it swings in are tuned by coordinate descent on the planned lap time. Each point on it gets the fastest speed whose turn still fits the drone's tilt and thrust limits, then forward and backward passes add acceleration and braking, using only what the turn leaves of that envelope (a friction circle), so it brakes early for corners over a crest. The tracker feeds forward the acceleration the path needs (turning, speeding up, beating drag) and corrects any position and velocity error with PD feedback. The line on the course shows the plan, coloured blue (slow) to orange (fast).
@@ -45,6 +47,8 @@ The default autopilot flies a **racing line**: a smooth closed spline through ev
 **Ghost replay**: every lap is recorded (position, heading and tilt 20 times a second, plus the time at each gate), and the fastest one so far flies again as a translucent gold drone, in step with your current lap. The **Ghost** row in the stats shows how far ahead or behind it you were at the last gate. Your own best ghost is saved per course, difficulty and wind in this browser, so it is waiting for you next time.
 
 **Multi-drone races** (the **Field** button): the drone you watch takes pole and the rest of the field lines up abreast beside it. Every entrant is the same airframe on the same course in the same wind; only the autopilot differs. **Racing line** (red) flies the optimised line, **Vision** (blue) flies it but has to find the gates with its camera, **Smooth** (teal) flies an unshaped line with gentler acceleration and braking, **Steady** (purple) only uses 60% of the envelope in turns, and **Pursuit** (white) is the original gate-axis chaser. A timing tower ranks them like F1 timing loops: whoever has passed more gates, then whoever got there first, with the gap to the leader at the last gate, lapped drones, and the fastest lap in purple. Tap a name to follow that drone with the chase and onboard cameras. With **Pilot: you** you race the whole field.
+
+**Night mode** (the **Night** button) turns the gates into LED gates: blue when waiting, orange for the next one (which also lights its surroundings), green once passed, each with a soft glow and a pool of light on the ground. The watched drone carries a headlight. **Prop wash** is drawn in both modes: air leaves the props at the induced velocity from momentum theory (about 7 m/s at hover), and near the ground it spreads out into a ring of dust. The **Sound** button adds a synthesised motor whine whose pitch follows rotor speed, plus rushing air, gate blips and a crash crunch.
 
 The original autopilot, still available with the **Pilot** button, is pure pursuit along each gate's axis: the drone chases a point sliding along the line through the gate centre, so it lines up and flies straight through, slowing for sharp turns. If it predicts it would cross a gate off the opening, it swings wide and comes round for another try.
 

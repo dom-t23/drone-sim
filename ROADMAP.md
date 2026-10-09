@@ -31,6 +31,7 @@ A rough backlog, not a contract. Each night picks the item that will make the bi
 ## Showing off
 - [x] **Telemetry panel**: speed (vs plan), tilt and thrust (vs limits), distance off the line, gate splits vs best lap (2026-10-04).
   - **Next steps:** hover read-outs on the charts; a vision panel (estimate error per gate over time); export a lap's telemetry as CSV.
-- [ ] **Night mode** with LED-lit gates, prop wash particles and motor sound.
+- [x] **Night mode** with LED-lit gates (glow, ground light pools, a real light on the next gate), stars, moon and a drone headlight; drone LEDs; prop wash particles with a ground-effect dust ring (momentum theory); synthesised motor sound with gate, lap and crash cues (2026-10-09).
+  - **Next steps:** bloom (needs the three.js addons in the import map and a careful look at phone performance); sound for the other drones in a field race, panned and Doppler-shifted as they pass; a dusk setting between day and night; a camera shake on crash to go with the crunch; LED colour per drone in a field race.
 - [ ] **Landing page polish**: intro overlay, "what Claude built last night" from the changelog, version and build date in the corner.
 - [ ] **Performance**: holds 60 fps on a mid-range phone.

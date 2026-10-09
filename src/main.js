@@ -4,6 +4,8 @@ import { makeRace, syncRace, raceGap } from './race.js';
 import { makeGhostRecorder, recordGhost, ghostPose, encodeGhost, decodeGhost } from './ghost.js';
 import { makeTelemetry, resetTelemetry, sampleTelemetry, drawTelemetry } from './telemetry.js';
 import { ROSTER, rosterFor, makeField, syncField, standings, gapText } from './field.js';
+import { motorTone, makeWash, emitWash, stepWash, WASH } from './fx.js';
+import { makeAudio } from './audio.js';
 
 const DT = 1 / 120;
 const $ = (id) => document.getElementById(id);
@@ -27,7 +29,8 @@ const SKY = new THREE.Color('#1a2a44');
 scene.background = SKY;
 scene.fog = new THREE.Fog(SKY, 60, 220);
 
-scene.add(new THREE.HemisphereLight('#9fc3ff', '#2a2218', 0.9));
+const hemi = new THREE.HemisphereLight('#9fc3ff', '#2a2218', 0.9);
+scene.add(hemi);
 const sun = new THREE.DirectionalLight('#ffd7b0', 1.6);
 sun.position.set(-60, 90, 40);
 sun.castShadow = true;
@@ -74,6 +77,102 @@ const gateMatNext = new THREE.MeshStandardMaterial({ color: '#ff8a3d', emissive:
 const gateMatDone = new THREE.MeshStandardMaterial({ color: '#3ddc97', emissive: '#12a46a', emissiveIntensity: 0.35 });
 let gateMeshes = [];
 
+// ---------- night mode: LED gates, light pools, stars, a moon and a headlight ----------
+let night = false;
+function softTexture(draw) {
+  const cv = document.createElement('canvas');
+  cv.width = cv.height = 128;
+  draw(cv.getContext('2d'));
+  const tex = new THREE.CanvasTexture(cv);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+// a soft square ring the shape of the gate frame (bar centres at 30..98 px of 128)
+const FRAME_GLOW_SIZE = ((GATE_INNER + 0.28) / 2) * (128 / 34);
+const frameGlowTex = softTexture((c) => {
+  c.strokeStyle = '#fff';
+  c.shadowColor = '#fff';
+  c.lineWidth = 6;
+  for (const blur of [22, 14, 6]) {
+    c.shadowBlur = blur;
+    c.strokeRect(30, 30, 68, 68);
+  }
+});
+const radialTex = softTexture((c) => {
+  const g = c.createRadialGradient(64, 64, 0, 64, 64, 64);
+  g.addColorStop(0, 'rgba(255,255,255,1)');
+  g.addColorStop(0.35, 'rgba(255,255,255,.45)');
+  g.addColorStop(1, 'rgba(255,255,255,0)');
+  c.fillStyle = g;
+  c.fillRect(0, 0, 128, 128);
+});
+const glowMat = (map, color, opacity) => new THREE.MeshBasicMaterial({
+  map, color, opacity, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide,
+});
+const LED = { idle: '#6fa8ff', next: '#ff7a1a', done: '#22e08f' };
+const glowMats = { idle: glowMat(frameGlowTex, LED.idle, 0.7), next: glowMat(frameGlowTex, LED.next, 1), done: glowMat(frameGlowTex, LED.done, 0.85) };
+const poolMats = { idle: glowMat(radialTex, LED.idle, 0.22), next: glowMat(radialTex, LED.next, 0.5), done: glowMat(radialTex, LED.done, 0.3) };
+// how the gate frames themselves look by day and lit up at night: [colour, emissive, intensity]
+const GATE_LOOK = {
+  idle: [gateMatIdle, ['#d9e2ef', '#000000', 0], ['#202a3a', LED.idle, 1.5]],
+  next: [gateMatNext, ['#ff8a3d', '#ff6a10', 0.6], ['#ff8a3d', LED.next, 2.4]],
+  done: [gateMatDone, ['#3ddc97', '#12a46a', 0.35], ['#3ddc97', LED.done, 1.7]],
+};
+const LOOK = {
+  day: { sky: '#1a2a44', fog: [60, 220], hemi: 0.9, sun: ['#ffd7b0', 1.6], ground: '#1d2b22', grid: 1 },
+  night: { sky: '#03060d', fog: [45, 200], hemi: 0.1, sun: ['#9db8ff', 0.3], ground: '#0c140f', grid: 0.4 },
+};
+// the next gate lights the ground and the drone around it
+const gateLight = new THREE.PointLight(LED.next, 60, 28, 2);
+gateLight.visible = false;
+scene.add(gateLight);
+// FPV headlight on the drone being watched
+const headlight = new THREE.SpotLight('#e4edff', 120, 60, 0.5, 0.55, 1.6);
+headlight.visible = false;
+scene.add(headlight, headlight.target);
+// stars and a moon, beyond the fog
+const stars = (() => {
+  const n = 900, pos = new Float32Array(n * 3);
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * Math.PI * 2, y = 0.04 + 0.96 * Math.random() ** 1.6, r = Math.sqrt(1 - y * y);
+    pos.set([Math.cos(a) * r * 380, y * 380, Math.sin(a) * r * 380], i * 3);
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  const pts = new THREE.Points(geo, new THREE.PointsMaterial({ color: '#dfe8ff', size: 1.6, sizeAttenuation: false, fog: false, transparent: true, opacity: 0.85 }));
+  pts.visible = false;
+  return pts;
+})();
+const moon = new THREE.Sprite(new THREE.SpriteMaterial({ map: radialTex, color: '#dfe8ff', fog: false, depthWrite: false }));
+moon.position.set(-60, 90, 40).setLength(360);
+moon.scale.setScalar(34);
+moon.visible = false;
+scene.add(stars, moon);
+
+function applyLook() {
+  const L = LOOK[night ? 'night' : 'day'];
+  scene.background.set(L.sky);
+  scene.fog.color.set(L.sky);
+  [scene.fog.near, scene.fog.far] = L.fog;
+  hemi.intensity = L.hemi;
+  sun.color.set(L.sun[0]);
+  sun.intensity = L.sun[1];
+  ground.material.color.set(L.ground);
+  grid.material.color.setScalar(L.grid);
+  for (const [mat, day, nite] of Object.values(GATE_LOOK)) {
+    const [c, e, k] = night ? nite : day;
+    mat.color.set(c);
+    mat.emissive.set(e);
+    mat.emissiveIntensity = k;
+  }
+  for (const g of gateMeshes) g.userData.glow.visible = g.userData.pool.visible = night;
+  gateLight.visible = headlight.visible = stars.visible = moon.visible = night;
+  ledMat.forEach((m) => (m.opacity = night ? 1 : 0.8));
+  washMat.blending = night ? THREE.AdditiveBlending : THREE.NormalBlending;
+  washMat.needsUpdate = true;
+  $('b-night').classList.toggle('on', night);
+}
+
 function makeGate(gate) {
   const g = new THREE.Group();
   const t = 0.28, s = GATE_INNER;
@@ -89,6 +188,15 @@ function makeGate(gate) {
     m.castShadow = true;
     g.add(m);
   }
+  // night: a soft LED glow around the frame, and a pool of its light on the ground
+  const glow = new THREE.Mesh(new THREE.PlaneGeometry(FRAME_GLOW_SIZE, FRAME_GLOW_SIZE), glowMats.idle);
+  glow.visible = night;
+  g.add(glow);
+  const pool = new THREE.Mesh(new THREE.PlaneGeometry(10, 10), poolMats.idle);
+  pool.rotation.x = -Math.PI / 2;
+  pool.position.set(gate.pos[0], 0.03, gate.pos[2]);
+  pool.visible = night;
+  g.userData = { glow, pool };
   g.position.set(...gate.pos);
   g.lookAt(gate.pos[0] + gate.normal[0], gate.pos[1] + gate.normal[1], gate.pos[2] + gate.normal[2]);
   return g;
@@ -126,7 +234,12 @@ function makeGhost(b) {
 }
 
 function setGateMat(i, mat) {
-  gateMeshes[i].children.forEach((c, k) => { if (k < 4) c.material = mat; });
+  const g = gateMeshes[i];
+  g.children.forEach((c, k) => { if (k < 4) c.material = mat; });
+  const key = mat === gateMatNext ? 'next' : mat === gateMatDone ? 'done' : 'idle';
+  g.userData.glow.material = glowMats[key];
+  g.userData.pool.material = poolMats[key];
+  if (key === 'next') gateLight.position.copy(g.position);
 }
 
 function buildWorld() {
@@ -151,7 +264,7 @@ function buildWorld() {
   writeHash();
   gateMeshes = sim.course.gates.map((g) => {
     const m = makeGate(g);
-    world.add(m, ...makeLegs(g));
+    world.add(m, m.userData.pool, ...makeLegs(g));
     return m;
   });
   setGateMat(0, gateMatNext);
@@ -218,6 +331,7 @@ function drawRacingLine() {
 
 // ---------- drone model ----------
 const drone = new THREE.Group();
+const ledMat = [];
 {
   const body = new THREE.Mesh(
     new THREE.BoxGeometry(0.34, 0.1, 0.42),
@@ -245,6 +359,17 @@ const drone = new THREE.Group();
     prop.position.set(x * 0.29, 0.05, z * 0.29);
     drone.add(prop);
   }
+  // LEDs: red and green at the front, blue at the back. In a Group so the field's
+  // repaint (which picks meshes by child index) leaves them alone.
+  const leds = new THREE.Group();
+  for (const [x, z, c] of [[0.29, 0.29, '#ff3b3b'], [-0.29, 0.29, '#3bff7a'], [0.29, -0.29, '#5ab0ff'], [-0.29, -0.29, '#5ab0ff']]) {
+    const m = new THREE.MeshBasicMaterial({ color: c, transparent: true, opacity: 0.8 });
+    ledMat.push(m);
+    const led = new THREE.Mesh(new THREE.SphereGeometry(0.03, 8, 6), m);
+    led.position.set(x, -0.02, z);
+    leds.add(led);
+  }
+  drone.add(leds);
   drone.scale.setScalar(2.2); // a little larger than life so it reads on screen
 }
 scene.add(drone);
@@ -468,6 +593,39 @@ function updateDebris(dt) {
   debrisGeo.attributes.position.needsUpdate = true;
 }
 
+// ---------- prop wash: air blown down through the props, kicking up dust near the ground ----------
+const wash = makeWash();
+const washPos = new THREE.BufferAttribute(wash.pos, 3);
+const washCol = new THREE.BufferAttribute(new Float32Array(wash.n * 4), 4);
+const washGeo = new THREE.BufferGeometry();
+washGeo.setAttribute('position', washPos);
+washGeo.setAttribute('color', washCol);
+const washMat = new THREE.PointsMaterial({ size: 0.45, map: radialTex, vertexColors: true, transparent: true, depthWrite: false });
+const washPts = new THREE.Points(washGeo, washMat);
+washPts.frustumCulled = false;
+scene.add(washPts);
+const WASH_TINT = { day: { air: [1, 1, 1, 0.05], dust: [0.66, 0.6, 0.48, 0.55] }, night: { air: [0.45, 0.6, 1, 0.22], dust: [0.75, 0.7, 0.6, 0.35] } };
+function updateWash(dtSim) {
+  const vs = viewSim();
+  if (dtSim > 0) {
+    emitWash(wash, vs.drone, dtSim, { crashed: !!vs.crash, scale: 2.2, wind: vs.wind?.now });
+    stepWash(wash, dtSim);
+  }
+  const tint = WASH_TINT[night ? 'night' : 'day'], c = washCol.array;
+  for (let i = 0; i < wash.n; i++) {
+    const t = wash.age[i] / WASH.life, src = wash.dust[i] ? tint.dust : tint.air;
+    const a = t >= 1 ? 0 : src[3] * (1 - t) * Math.min(1, t * 8);
+    c[i * 4] = src[0]; c[i * 4 + 1] = src[1]; c[i * 4 + 2] = src[2]; c[i * 4 + 3] = a;
+  }
+  washPos.needsUpdate = washCol.needsUpdate = true;
+}
+function updateHeadlight() {
+  if (!night) return;
+  const d = viewSim().drone, f = [Math.sin(d.yaw), 0, Math.cos(d.yaw)];
+  headlight.position.set(d.pos[0] + f[0] * 0.6, d.pos[1] + 0.1, d.pos[2] + f[2] * 0.6);
+  headlight.target.position.set(d.pos[0] + f[0] * 14, d.pos[1] - 3, d.pos[2] + f[2] * 14);
+}
+
 // ---------- wind streaks: short dashes drifting with the wind around the drone ----------
 const STREAKS = 160, STREAK_BOX = 36;
 const streakPos = new Float32Array(STREAKS * 6), streakSeed = [];
@@ -548,6 +706,7 @@ function updateHud(force) {
     const e = sim.events[lastEvents];
     if (e.type === 'lap') toast(pilot === 'manual' ? lapToast(e.time) : `Lap ${fmt(e.time)}`);
     if (e.type === 'gate') onGate(e.gate);
+    if (e.type === 'gate' || e.type === 'lap' || e.type === 'crash') audio.cue(e.type);
     if (e.type === 'miss') toast(`Missed gate ${e.gate + 1}`, true);
     if (e.type === 'crash') {
       toast(e.what === 'pillar' ? 'Crashed into a pillar' : `Crashed into gate ${e.gate + 1}`, true);
@@ -667,6 +826,18 @@ $('b-wind').onclick = () => {
   syncButtons();
   buildWorld();
 };
+$('b-night').onclick = () => {
+  night = !night;
+  applyLook();
+  writeHash();
+  toast(night ? 'Night' : 'Day');
+};
+const audio = makeAudio();
+if (!audio.supported) $('b-sound').hidden = true;
+$('b-sound').onclick = () => {
+  const on = audio.setOn(!audio.on);
+  $('b-sound').classList.toggle('on', on);
+};
 $('b-share').onclick = () => {
   const url = location.href;
   if (navigator.clipboard?.writeText) {
@@ -699,17 +870,20 @@ function readHash() {
   windMode = WIND_MODES.includes(p.get('wind')) ? p.get('wind') : 'off';
   pilot = PILOTS.includes(p.get('pilot')) ? p.get('pilot') : 'racing';
   fieldOn = p.get('field') === '1';
+  night = p.get('night') === '1';
   syncButtons();
 }
 function writeHash() {
-  const h = `#seed=${seed}&d=${difficulty}${nav === 'truth' ? '' : `&nav=${nav}`}${windMode === 'off' ? '' : `&wind=${windMode}`}${pilot === 'racing' ? '' : `&pilot=${pilot}`}${fieldOn ? '&field=1' : ''}`;
+  const h = `#seed=${seed}&d=${difficulty}${nav === 'truth' ? '' : `&nav=${nav}`}${windMode === 'off' ? '' : `&wind=${windMode}`}${pilot === 'racing' ? '' : `&pilot=${pilot}`}${fieldOn ? '&field=1' : ''}${night ? '&night=1' : ''}`;
   if (location.hash !== h) history.replaceState(null, '', h);
 }
 addEventListener('hashchange', () => {
   const key = () => `${seed}/${difficulty}/${nav}/${windMode}/${pilot}/${fieldOn}`;
   const before = key();
+  const wasNight = night;
   readHash();
   if (key() !== before) buildWorld();
+  if (night !== wasNight) applyLook();
 });
 $('b-pilot').onclick = () => {
   pilot = PILOTS[(PILOTS.indexOf(pilot) + 1) % PILOTS.length];
@@ -792,6 +966,8 @@ addEventListener('keydown', (e) => {
   if (e.key === 't') $('b-tm').click();
   if (e.key === 'g') $('b-ghost').click();
   if (e.key === 'f') $('b-field').click();
+  if (e.key === 'l') $('b-night').click();
+  if (e.key === 'm') $('b-sound').click();
 });
 
 // ---------- onboard overlay: what the camera detected this frame ----------
@@ -928,6 +1104,9 @@ function frame(now) {
   updateGhost();
   updateStreaks(steps * DT);
   updateDebris(steps * DT);
+  updateWash(steps * DT);
+  updateHeadlight();
+  { const vs = viewSim(); audio.update(motorTone(vs.drone, { crashed: !!vs.crash })); }
   propSpin += dtFrame * 60;
   updateCameras(dtFrame);
   updateHud();
@@ -984,5 +1163,6 @@ addEventListener('resize', () => {
 
 readHash();
 buildWorld();
+applyLook();
 chaseCam.position.set(sim.drone.pos[0], 6, sim.drone.pos[2] - 12);
 requestAnimationFrame(frame);
