@@ -416,14 +416,76 @@ export function racingPilot(sim) {
   const q = plan.pts[track.idx];
   const qa = plan.pts[(track.idx + ahead) % N];
   const cap = 3 + P.launchRate * (sim.t - Math.max(sim.launchAt, sim.respawnAt ?? -Infinity)); // gentle launch from a standstill
-  const vRef = Math.min(qa.v, cap);
-  const atRef = vRef < qa.v ? Math.min(P.aAccel, P.launchRate) : qa.at;
+  // in a race, step aside for (or hold back behind) other drones
+  const tr = sim.traffic ? dodge(sim, drone, qa, speed) : null;
+  // (hold-back braking is limited to TRAFFIC.brake, so it never starves the steering)
+  // (not before the start gate: off the grid, everyone goes for it)
+  const vHold = tr && sim.state.gatesPassed > 0 ? Math.max(tr.vCap, v3.dot(drone.vel, qa.t) - TRAFFIC.brake / P.kd) : Infinity;
+  const vRef = Math.max(0, Math.min(qa.v, cap, vHold));
+  const atRef = vRef < qa.v ? (vRef < cap ? 0 : Math.min(P.aAccel, P.launchRate)) : qa.at;
   const velRef = v3.scale(qa.t, vRef);
   let a = v3.add(v3.scale(qa.kv, vRef * vRef), v3.scale(qa.t, atRef));
   a = v3.add(a, v3.scale(velRef, DRONE.drag));
-  a = v3.add(a, v3.scale(v3.sub(q.p, drone.pos), P.kp));
+  const ref = tr ? v3.add(q.p, tr.off) : q.p;
+  a = v3.add(a, v3.scale(v3.sub(ref, drone.pos), P.kp));
   a = v3.add(a, v3.scale(v3.sub(velRef, drone.vel), P.kd));
   return v3.add(a, [0, G, 0]);
+}
+
+// Racecraft. sim.traffic (set each step by whoever runs a multi-drone race) lists the other
+// drones as { pos, vel }. For each one, find the closest approach over the next
+// TRAFFIC.horizon seconds; if it would come within TRAFFIC.clear, shift this drone's
+// reference point sideways (square to the line), away from where the other will be. A
+// drone dead ahead on the same line is passed on the inside of the turn. The shift is
+// squeezed in before every gate, so a pass never costs a frame, and eased in and out.
+// If a slower drone is still in the way, hold back like adaptive cruise control: never
+// close on it faster than braking at TRAFFIC.brake could stop TRAFFIC.gap behind it.
+export const TRAFFIC = { horizon: 1.2, clear: 1.6, dodge: 1.3, max: 2.0, atGate: 0.3, tau: 0.25, range: 15, brake: 8, gap: 1.5, funnel: 15, giveWay: 12 };
+function dodge(sim, me, qa, speed) {
+  const T = TRAFFIC, t = qa.t, dt = 1 / 120;
+  let want = [0, 0, 0], vCap = Infinity;
+  const P = sim.plan, s = sim.track.idx * P.ds, L = P.length;
+  let toGate = Infinity; // metres along the line to the next gate (or just past the last one)
+  for (const g of P.gateS) toGate = Math.min(toGate, ((g - s) % L + L) % L, ((s - g) % L + L) % L + 1);
+  const perp = (v) => v3.sub(v, v3.scale(t, v3.dot(v, t)));
+  for (const o of sim.traffic) {
+    const r = v3.sub(o.pos, me.pos);
+    if (v3.len(r) > T.range) continue;
+    const vr = v3.sub(o.vel, me.vel), vv = v3.dot(vr, vr);
+    const tc = vv > 1e-6 ? Math.max(0, Math.min(T.horizon, -v3.dot(r, vr) / vv)) : 0;
+    const c = v3.add(r, v3.scale(vr, tc)); // where it will be, relative to me, at closest approach
+    const miss = v3.len(c);
+    const along = v3.dot(r, t), side = v3.len(perp(r));
+    if (along > 0 && (side < (toGate < T.funnel ? T.clear + 1.2 : T.clear * 0.9) || miss < T.clear)) {
+      // in front and in my way (and before a gate, anywhere in the same opening): don't
+      // close faster than I could stop T.gap behind it, and drop back if I'm closer
+      const d = along - T.gap;
+      vCap = Math.min(vCap, Math.max(0, v3.dot(o.vel, t)) + Math.sign(d) * Math.sqrt(2 * T.brake * Math.abs(d)));
+    }
+    if (miss >= T.clear) continue;
+    let away = perp(v3.scale(c, -1));
+    if (v3.len(away) < 0.25) {
+      // dead ahead or behind on my line: go round on the inside of the turn, or to the left
+      away = perp(qa.kv);
+      if (v3.len(away) < 1e-3) away = [t[2], 0, -t[0]];
+    }
+    const urgency = (1 - tc / T.horizon) * (1 - miss / T.clear) * 2;
+    want = v3.add(want, v3.scale(v3.norm(away), T.dodge * Math.min(1, urgency)));
+  }
+  // room to move: full width in the open, squeezed down before each gate
+  let room = T.atGate + (T.max - T.atGate) * Math.max(0, Math.min(1, (toGate - 3) / Math.max(4, speed * 0.7)));
+  // already off the line (converging from a grid slot, or knocked aside): less room to use
+  const cur = sim.dodge ?? [0, 0, 0];
+  const err = v3.len(perp(v3.sub(v3.sub(me.pos, sim.plan.pts[sim.track.idx].p), cur)));
+  room = Math.max(0, room - Math.max(0, err - 0.3));
+  const n = v3.len(want);
+  if (n > room) want = v3.scale(want, room / n);
+  let next = v3.add(cur, v3.scale(v3.sub(want, cur), Math.min(1, dt / T.tau)));
+  const m = v3.len(next);
+  if (m > room) next = v3.scale(next, room / m); // the squeeze before a gate is never eased
+  if (sim.plan.pts[sim.track.idx].p[1] + next[1] < 1.2) next[1] = 1.2 - sim.plan.pts[sim.track.idx].p[1];
+  sim.dodge = next;
+  return { off: next, vCap };
 }
 
 // ---------- vision ----------
@@ -1267,6 +1329,7 @@ function respawn(sim) {
   d.vel = [0, 0, 0];
   d.thrust = [0, G, 0];
   delete d.tumble;
+  sim.kick = null;
   if (sim.est) {
     // put back by hand: roughly where it should be, and not moving
     const E = sim.est, off = [0, 1, 2].map(() => gauss(E.rand) * VIO.respawnSigma * 0.5);
@@ -1278,6 +1341,92 @@ function respawn(sim) {
   sim.crash = null;
   sim.respawnAt = sim.t + CRASH.hold;
   sim.events.push({ t: sim.t, type: 'respawn' });
+}
+
+// ---------- drone-to-drone contact ----------
+// Two drones are spheres of CRASH.radius. When they touch, they are pushed apart and swap
+// part of their closing speed (equal masses, a soft bounce). Bump gently from behind and
+// both fly on; hit hard (closing faster than CONTACT.crashSpeed) and props meet props:
+// both motors cut and both tumble, exactly like hitting a gate. Drones still on the pad,
+// tumbling, or holding at a respawn point are ghosts, so nobody respawns into a crash.
+export const CONTACT = {
+  restitution: 0.4,
+  crashSpeed: 6, // m/s closing speed that takes both drones out
+};
+const solid = (s) => !s.crash && s.t >= s.launchAt && s.t >= s.respawnAt;
+export function bump(a, b) {
+  if (!solid(a) || !solid(b)) return null;
+  const da = a.drone, db = b.drone, R = 2 * CRASH.radius;
+  const d = v3.sub(da.pos, db.pos), dist = v3.len(d);
+  if (dist >= R - 1e-9) return null;
+  const n = dist > 1e-6 ? v3.scale(d, 1 / dist) : [1, 0, 0]; // from b towards a
+  const closing = v3.dot(v3.sub(db.vel, da.vel), n); // > 0 when they are moving together
+  const half = (R - dist) / 2;
+  da.pos = v3.add(da.pos, v3.scale(n, half));
+  db.pos = v3.sub(db.pos, v3.scale(n, half));
+  const hit = { t: a.t, closing: Math.max(0, closing), pos: v3.add(db.pos, v3.scale(n, CRASH.radius)), crash: false };
+  if (closing <= 0) return hit; // already separating: just un-overlap
+  if (closing > CONTACT.crashSpeed) {
+    // each sees the other as the obstacle; vn is its own speed into it (relative)
+    startCrash(a, { n, depth: 0, what: 'drone', gate: null }, -closing / 2);
+    startCrash(b, { n: v3.scale(n, -1), depth: 0, what: 'drone', gate: null }, -closing / 2);
+    hit.crash = true;
+    return hit;
+  }
+  // equal masses: each takes half the (1 + e) impulse. The accelerometer feels the jolt.
+  const j = ((1 + CONTACT.restitution) * closing) / 2;
+  for (const [s, sign] of [[a, 1], [b, -1]]) {
+    const dv = v3.scale(n, sign * j);
+    s.drone.vel = v3.add(s.drone.vel, dv);
+    s.kick = v3.add(s.kick ?? [0, 0, 0], dv);
+    s.state.bumps = (s.state.bumps ?? 0) + 1;
+    s.events.push({ t: s.t, type: 'bump', speed: closing });
+  }
+  return hit;
+}
+
+// Tell every autopilot where the other drones are (see TRAFFIC). Drones that
+// aren't solid (on the pad, tumbling, respawning) are left out: there's nothing to avoid.
+export function shareTraffic(sims) {
+  for (const s of sims) {
+    if (s.pilot === 'manual') continue;
+    s.traffic = sims.filter((o) => o !== s && solid(o)).map((o) => ({ pos: o.drone.pos, vel: o.drone.vel }));
+  }
+}
+
+// The pursuit pilot has no racing line to shift, so it simply pushes sideways away from
+// anyone about to hit it (a back-marker getting out of the way of the leaders).
+function giveWay(sim, cmd) {
+  if (!sim.traffic?.length) return cmd;
+  const me = sim.drone, T = TRAFFIC;
+  let push = [0, 0, 0];
+  for (const o of sim.traffic) {
+    const r = v3.sub(o.pos, me.pos);
+    if (v3.len(r) > T.range) continue;
+    const vr = v3.sub(o.vel, me.vel), vv = v3.dot(vr, vr);
+    const tc = vv > 1e-6 ? Math.max(0, Math.min(T.horizon, -v3.dot(r, vr) / vv)) : 0;
+    const c = v3.add(r, v3.scale(vr, tc)), miss = v3.len(c);
+    if (miss >= T.clear) continue;
+    // away from the closest approach, square to the other's path
+    const u = vv > 1e-6 ? v3.scale(vr, 1 / Math.sqrt(vv)) : [0, 1, 0];
+    let away = v3.scale(v3.sub(c, v3.scale(u, v3.dot(c, u))), -1);
+    if (v3.len(away) < 0.1) away = [u[2], 0.3, -u[0]];
+    push = v3.add(push, v3.scale(v3.norm(away), T.giveWay * (1 - tc / T.horizon)));
+  }
+  // ...but never shoved into the frame of the gate it's about to fly through
+  const g = sim.course.gates[sim.state.target], dg = v3.len(v3.sub(g.pos, me.pos));
+  return v3.add(cmd, v3.scale(push, Math.max(0, Math.min(1, (dg - 4) / 8))));
+}
+
+// Every pair in a list of sims; returns the contacts made this step.
+export function bumpAll(sims) {
+  const hits = [];
+  for (let i = 0; i < sims.length; i++)
+    for (let k = i + 1; k < sims.length; k++) {
+      const h = bump(sims[i], sims[k]);
+      if (h && h.closing > 0) hits.push(h);
+    }
+  return hits;
 }
 
 // ---------- simulation ----------
@@ -1368,7 +1517,7 @@ export function step(sim, dt) {
   const { drone, course, state } = sim;
   const want =
     sim.t < sim.launchAt || sim.t < sim.respawnAt ? [0, G, 0] // on the pad, or just respawned
-      : sim.pilot === 'pursuit' ? autopilot(navState(sim), sim.belief ?? course, state)
+      : sim.pilot === 'pursuit' ? giveWay(sim, autopilot(navState(sim), sim.belief ?? course, state))
         : sim.pilot === 'manual' ? manualPilot(sim, dt)
           : racingPilot(sim);
   // cancel the disturbance the observer has measured (wind, mostly)
@@ -1381,6 +1530,9 @@ export function step(sim, dt) {
   const air = sim.wind ? v3.sub(drone.vel, sim.wind.now) : drone.vel; // air-relative velocity
   const acc = v3.sub(v3.sub(drone.thrust, [0, G, 0]), v3.scale(air, DRONE.drag));
   const prev = drone.pos, vPrev = drone.vel;
+  // a bump from another drone since the last step: the accelerometer felt that jolt
+  const vFelt = sim.kick ? v3.sub(vPrev, sim.kick) : vPrev;
+  sim.kick = null;
   // on the pad before the start, the drone is held still: wind can't push it off its
   // grid slot (or into a gate) during a countdown
   const onPad = sim.t < sim.launchAt;
@@ -1396,7 +1548,7 @@ export function step(sim, dt) {
   let navVel = vPrev;
   if (sim.est) {
     navVel = [sim.est.x[3], sim.est.x[4], sim.est.x[5]];
-    imuStep(sim, v3.scale(v3.sub(drone.vel, vPrev), 1 / dt), dt);
+    imuStep(sim, v3.scale(v3.sub(drone.vel, vFelt), 1 / dt), dt);
     if (onPad) {
       // held on the pad: it knows it isn't moving, which pins down the accelerometer bias
       ekfUpdate(sim.est, [0, 0, 0], m3.diag(VIO.zupt ** 2), 3);

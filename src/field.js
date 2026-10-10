@@ -18,16 +18,70 @@ export function rosterFor(hero) {
 }
 
 // entries: [{ id, name, sim }]. Gate times are pulled out of each sim's events.
-export function makeField(entries) {
-  return { entries: entries.map((e) => ({ ...e, times: [], seen: 0 })) };
+// laps: race length. The race clock starts at the green light (start, in sim seconds).
+export const RACE = { laps: 3, timeout: 30 };
+export function makeField(entries, { laps = RACE.laps, start = 0 } = {}) {
+  return {
+    entries: entries.map((e) => ({ ...e, times: [], seen: 0, finish: null, bumps: 0, crashes: 0 })),
+    laps, start, flag: null, // flag: sim time the winner took the chequered flag
+    order: [], // ids in the order they took the flag
+    over: false, // results are final
+  };
 }
 
-export function syncField(field) {
+// Pull new events out of each sim. The winner is the first to complete `laps` laps
+// (that is, to cross the start gate laps + 1 times: the first crossing starts lap 1).
+// Once the flag is out, everyone else finishes the next time they cross the line, with
+// however many laps they've done, as in real racing. Results are final when all have
+// finished, or RACE.timeout seconds after the flag (anyone still out is "DNF").
+export function syncField(field, gatesPerLap) {
   for (const e of field.entries) {
     const ev = e.sim.events;
-    for (; e.seen < ev.length; e.seen++) if (ev[e.seen].type === 'gate') e.times.push(ev[e.seen].t);
+    for (; e.seen < ev.length; e.seen++) {
+      const x = ev[e.seen];
+      if (x.type === 'bump') e.bumps++;
+      if (x.type === 'crash') e.crashes++;
+      if (x.type !== 'gate') continue;
+      e.times.push(x.t);
+      if (!gatesPerLap || e.finish || field.over || x.gate !== 0) continue;
+      const laps = (e.times.length - 1) / gatesPerLap;
+      if (laps >= field.laps || (field.flag != null && x.t > field.flag && laps >= 1)) {
+        e.finish = { t: x.t, laps, time: x.t - field.start };
+        if (field.flag == null) field.flag = x.t;
+        field.order.push(e.id);
+      }
+    }
+  }
+  if (field.flag != null && !field.over) {
+    const now = Math.max(...field.entries.map((e) => e.sim.t));
+    field.over = field.entries.every((e) => e.finish) || now - field.flag >= RACE.timeout;
   }
   return field;
+}
+
+// The classification: finishers in the order they took the flag (more laps always ahead),
+// then anyone who didn't finish, by gates passed. gap is to the winner: seconds on the
+// same lap count, else whole laps down.
+export function results(field) {
+  const byId = Object.fromEntries(field.entries.map((e) => [e.id, e]));
+  const done = field.order.map((id) => byId[id]).sort((a, b) => b.finish.laps - a.finish.laps || a.finish.t - b.finish.t);
+  const rest = field.entries.filter((e) => !e.finish).sort((a, b) => b.times.length - a.times.length || (a.times.at(-1) ?? Infinity) - (b.times.at(-1) ?? Infinity));
+  const win = done[0];
+  return [...done, ...rest].map((e, i) => {
+    const laps = e.sim.state.laps;
+    const row = {
+      pos: i + 1, id: e.id, name: e.name, finished: !!e.finish,
+      laps: e.finish ? e.finish.laps : Math.max(0, Math.floor((e.times.length - 1) / (e.sim.course.gates.length))),
+      time: e.finish ? e.finish.time : null,
+      best: laps.length ? Math.min(...laps) : null,
+      gap: null, down: 0, crashes: e.crashes, bumps: e.bumps,
+    };
+    if (e.finish && win && e !== win) {
+      row.down = win.finish.laps - e.finish.laps;
+      if (!row.down) row.gap = e.finish.time - win.finish.time;
+    }
+    return row;
+  });
 }
 
 // Standings, like a timing tower: whoever has passed more gates is ahead; on the same gate,

@@ -1,9 +1,9 @@
 import * as THREE from 'three';
-import { makeSim, step, GATE_INNER, v3, DIFFICULTIES, NAV_MODES, WIND_MODES, PILOTS, DRONE, navError } from './sim.js';
+import { makeSim, step, GATE_INNER, v3, DIFFICULTIES, NAV_MODES, WIND_MODES, PILOTS, DRONE, navError, shareTraffic, bumpAll } from './sim.js';
 import { makeRace, syncRace, raceGap } from './race.js';
 import { makeGhostRecorder, recordGhost, ghostPose, encodeGhost, decodeGhost } from './ghost.js';
 import { makeTelemetry, resetTelemetry, sampleTelemetry, drawTelemetry } from './telemetry.js';
-import { ROSTER, rosterFor, makeField, syncField, standings, gapText } from './field.js';
+import { ROSTER, rosterFor, makeField, syncField, standings, gapText, results, RACE } from './field.js';
 import { motorTone, makeWash, emitWash, stepWash, WASH } from './fx.js';
 import { makeAudio } from './audio.js';
 
@@ -68,6 +68,7 @@ const COUNTDOWN = 3; // s on the pad before a race starts
 // field.entries[0] is always the hero (sim, the drone the HUD describes); followId picks
 // which drone the cameras follow.
 let fieldOn = false, field = null, followId = 'hero', lastLeader = null;
+let fieldSims = [], flagShown = false; // all the field's sims, for traffic and contact
 const HERO_COLOR = '#ff8a3d';
 const telemetry = makeTelemetry($('telemetry'));
 scene.add(world);
@@ -456,6 +457,9 @@ function buildField() {
   setFollow('hero');
   lastLeader = null;
   $('board').hidden = !fieldOn;
+  $('results').hidden = true;
+  fieldSims = [];
+  resultsClosed = false;
   if (!fieldOn) return;
   const entries = [{ id: 'hero', name: heroName(), color: HERO_COLOR, sim, mesh: drone }];
   // the hero takes pole, on the line; the rest line up abreast, alternately left and right
@@ -471,7 +475,10 @@ function buildField() {
       syncMesh(e.mesh, e.sim.drone);
     }
   }
-  field = makeField(entries);
+  field = makeField(entries, { laps: RACE.laps, start: COUNTDOWN });
+  fieldSims = entries.map((e) => e.sim);
+  flagShown = false;
+  $('results').hidden = true;
   boardHtml = '';
 }
 const viewEntry = () => field?.entries.find((e) => e.id === followId) ?? null;
@@ -483,7 +490,14 @@ function setFollow(id) {
   viewMesh().add(camMount);
 }
 function updateField() {
-  syncField(field);
+  syncField(field, sim.course.gates.length);
+  if (field.flag != null && !flagShown) {
+    flagShown = true;
+    const win = field.entries.find((e) => e.id === field.order[0]);
+    toast(`Chequered flag: ${win.id === 'hero' && pilot === 'manual' ? 'you win!' : `${win.name} wins`}`);
+    audio.cue('lap');
+  }
+  if (field.over && $('results').hidden && !resultsClosed) showResults();
   for (const e of field.entries) {
     if (e.id !== 'hero') syncMesh(e.mesh, e.sim.drone);
     const p = e.sim.drone.pos;
@@ -504,12 +518,20 @@ function updateBoard() {
     lastLeader = lead.id;
   }
   const color = Object.fromEntries(field.entries.map((e) => [e.id, e.color]));
-  const lap = Math.max(1, ...rows.map((r) => r.lap));
-  const html = `<div class="board-head"><span>Race · lap ${lap}</span><small>tap to follow</small></div>` + rows.map((r) => {
+  const lap = Math.min(field.laps, Math.max(1, ...rows.map((r) => r.lap)));
+  // once the flag is out, the finishers are frozen in the order they took it
+  if (field.flag != null) {
+    const fin = new Map(results(field).filter((r) => r.finished).map((r) => [r.id, r]));
+    const done = [...fin.values()], running = rows.filter((r) => !fin.has(r.id));
+    rows.splice(0, rows.length, ...done.map((d) => ({ ...rows.find((r) => r.id === d.id), fin: d })), ...running);
+    rows.forEach((r, i) => { r.pos = i + 1; });
+  }
+  const head = field.over ? 'Result' : field.flag != null ? 'Chequered flag' : `Race · lap ${lap}/${field.laps}`;
+  const html = `<div class="board-head"><span>${head}</span><small>tap to follow</small></div>` + rows.map((r) => {
     const cls = [r.id === followId && 'cam', r.id === 'hero' && 'hero'].filter(Boolean).join(' ');
-    const gap = r.pos === 1 ? (r.gates ? 'Leader' : '') : gapText(r);
+    const gap = r.fin ? finGap(r.fin) : field.flag != null ? (field.over ? 'DNF' : '…') : r.pos === 1 ? (r.gates ? 'Leader' : '') : gapText(r);
     return `<div class="row ${cls}" data-id="${r.id}"><i>${r.pos}</i><span class="dot" style="background:${color[r.id]}"></span>`
-      + `<span class="nm">${esc(r.name)}${r.crashed ? ' <em class="out">crash</em>' : ''}</span><b>${gap}</b>`
+      + `<span class="nm">${r.fin ? '<span class="chq"></span>' : ''}${esc(r.name)}${r.crashed ? ' <em class="out">crash</em>' : ''}</span><b>${gap}</b>`
       + `<em class="${r.fastest ? 'fl' : ''}">${r.best == null ? '' : r.best.toFixed(2)}</em></div>`;
   }).join('');
   if (html !== boardHtml) $('board').innerHTML = boardHtml = html;
@@ -523,6 +545,43 @@ $('board').addEventListener('click', (e) => {
   const who = viewEntry();
   if (who) toast(who.id === 'hero' ? 'Following you' : `Following ${who.name}`);
 });
+// A finisher's line in the tower and the results: winner's race time, else the gap.
+function finGap(f) {
+  if (f.pos === 1) return fmtRace(f.time);
+  return f.down ? `+${f.down} lap${f.down > 1 ? 's' : ''}` : `+${f.gap.toFixed(2)}`;
+}
+const fmtRace = (t) => `${Math.floor(t / 60)}:${(t % 60).toFixed(2).padStart(5, '0')}`;
+// Drone-to-drone contact: sparks (a crash already throws its own debris) and a word.
+let lastContactToast = -Infinity;
+function onContact(h) {
+  if (h.crash || h.closing < 1.5) return;
+  burst(h.pos, [0, 0, 0]);
+  if (sim.t - lastContactToast > 3) {
+    lastContactToast = sim.t;
+    toast('Contact!');
+  }
+}
+// The results card, once everyone has taken the flag (or the race has timed out).
+let resultsClosed = false;
+function showResults() {
+  const color = Object.fromEntries(field.entries.map((e) => [e.id, e.color]));
+  const rows = results(field);
+  const contacts = field.entries.reduce((a, e) => a + e.bumps, 0) / 2;
+  const crashes = field.entries.reduce((a, e) => a + e.crashes, 0);
+  const win = rows[0];
+  const title = '<span class="chq"></span>' + (!win.finished ? 'Race over' : win.id === 'hero' && pilot === 'manual' ? 'You win!' : `${esc(win.name)} wins`);
+  $('results-body').innerHTML = `<div class="res-title">${title}<small>${field.laps} laps · ${difficulty} course ${seed}${windMode === 'off' ? '' : ` · ${windMode}`}</small></div>`
+    + '<div class="res-row res-hd"><i></i><span></span><span>Drone</span><b>Time</b><em>Best lap</em></div>'
+    + rows.map((r) => `<div class="res-row${r.id === 'hero' ? ' hero' : ''}"><i>${r.finished ? r.pos : '–'}</i><span class="dot" style="background:${color[r.id]}"></span>`
+      + `<span class="nm">${esc(field.entries.find((e) => e.id === r.id).name)}${r.crashes ? ` <em class="out">${r.crashes} crash${r.crashes > 1 ? 'es' : ''}</em>` : ''}</span>`
+      + `<b>${r.finished ? finGap(r) : 'DNF'}</b><em>${r.best == null ? '–' : r.best.toFixed(2)}</em></div>`).join('')
+    + `<div class="res-foot">${Math.round(contacts)} contact${Math.round(contacts) === 1 ? '' : 's'} · ${crashes} crash${crashes === 1 ? '' : 'es'}</div>`;
+  $('results').hidden = false;
+}
+$('res-again').onclick = () => { resultsClosed = false; buildWorld(); };
+$('res-next').onclick = () => { resultsClosed = false; $('b-course').click(); };
+$('res-close').onclick = () => { resultsClosed = true; $('results').hidden = true; };
+
 // Fly the ghost to where the best lap was at this point in the current lap. Hidden when
 // it sits right on top of the drone (a repeatable autopilot lap matches itself).
 function updateGhost() {
@@ -747,7 +806,7 @@ function updateHud(force) {
     if (e.type === 'gate' || e.type === 'lap' || e.type === 'crash') audio.cue(e.type);
     if (e.type === 'miss') toast(`Missed gate ${e.gate + 1}`, true);
     if (e.type === 'crash') {
-      toast(e.what === 'pillar' ? 'Crashed into a pillar' : `Crashed into gate ${e.gate + 1}`, true);
+      toast(e.what === 'pillar' ? 'Crashed into a pillar' : e.what === 'drone' ? 'Mid-air collision!' : `Crashed into gate ${e.gate + 1}`, true);
       burst(e.pos, sim.drone.vel);
     }
     if (e.type === 'respawn') trailCount = 0; // don't draw a line to the respawn point
@@ -1005,6 +1064,7 @@ addEventListener('keydown', (e) => {
   if (e.key === 't') $('b-tm').click();
   if (e.key === 'g') $('b-ghost').click();
   if (e.key === 'f') $('b-field').click();
+  if (e.key === 'Escape' && !$('results').hidden) $('res-close').click();
   if (e.key === 'l') $('b-night').click();
   if (e.key === 'm') $('b-sound').click();
 });
@@ -1124,10 +1184,14 @@ function frame(now) {
   if (pilot === 'manual') sim.stick = readSticks(dtFrame);
   let steps = 0;
   while (acc >= DT && steps < 1200) {
+    if (field) shareTraffic(fieldSims);
     step(sim, DT);
     if (recordGhost(ghostRec, sim) && pilot === 'manual') saveGhost(ghostRec.best);
     if (rival) step(rival, DT);
-    if (field) for (const e of field.entries) if (e.sim !== sim) step(e.sim, DT);
+    if (field) {
+      for (const e of field.entries) if (e.sim !== sim) step(e.sim, DT);
+      for (const h of bumpAll(fieldSims)) onContact(h);
+    }
     sampleTelemetry(telemetry, sim);
     acc -= DT;
     if (++steps % 6 === 0) pushTrail(sim.drone.pos);

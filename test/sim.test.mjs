@@ -5,9 +5,9 @@ import {
   makeSim, step, planRacingLine, makeCourse, v3, GATE_INNER, DRONE, G, DIFFICULTIES,
   cameraPose, project, gateCorners, solveGatePose, CAMERA, optimiseLine, SHAPING, WIND,
   MANUAL, headingAxes, CRASH, FRAME, collide, makeScenery, gridOffset, GRID,
-  NAV_MODES, IMU, VIO, navError, bodyAxes,
+  NAV_MODES, IMU, VIO, navError, bodyAxes, bump, bumpAll, shareTraffic, CONTACT, TRAFFIC,
 } from '../src/sim.js';
-import { ROSTER, rosterFor, makeField, syncField, standings, gapText } from '../src/field.js';
+import { ROSTER, rosterFor, makeField, syncField, standings, gapText, results, RACE } from '../src/field.js';
 import { makeRace, syncRace, raceGap } from '../src/race.js';
 import { makeSplits, splitsOnEvent } from '../src/splits.js';
 import { ROTOR, WASH, rotorSpeed, inducedVelocity, motorTone, makeWash, emitWash, stepWash } from '../src/fx.js';
@@ -1131,4 +1131,176 @@ test('vio flights are deterministic', () => {
   assert.deepEqual(a.drone.pos, b.drone.pos);
   assert.deepEqual([...a.est.x], [...b.est.x]);
   assert.deepEqual(a.est.stats, b.est.stats);
+});
+
+// ---------- drone-to-drone contact, racecraft and race results ----------
+
+// Two launched drones, the second placed relative to the first.
+function pair(offset, va, vb) {
+  const a = makeSim({ seed: 1 }), b = makeSim({ seed: 1 });
+  for (let i = 0; i < 120; i++) { step(a, 1 / 120); step(b, 1 / 120); } // both off the pad
+  b.drone.pos = v3.add(a.drone.pos, offset);
+  a.drone.vel = va.slice();
+  b.drone.vel = vb.slice();
+  return [a, b];
+}
+
+test('contact: a gentle bump pushes two drones apart and trades speed; nobody crashes', () => {
+  const [a, b] = pair([0, 0, 0.4], [0, 0, 12], [0, 0, 9]); // a is 3 m/s faster, right behind b
+  const before = v3.add(a.drone.vel, b.drone.vel);
+  const h = bump(a, b);
+  assert.ok(h && !h.crash && Math.abs(h.closing - 3) < 1e-9);
+  assert.ok(v3.len(v3.sub(a.drone.pos, b.drone.pos)) >= 2 * CRASH.radius - 1e-9, 'still overlapping');
+  // momentum is kept (equal masses) and they now separate at the restitution share of 3 m/s
+  assert.ok(v3.len(v3.sub(v3.add(a.drone.vel, b.drone.vel), before)) < 1e-9);
+  assert.ok(Math.abs(b.drone.vel[2] - a.drone.vel[2] - 3 * CONTACT.restitution) < 1e-9);
+  assert.equal(a.crash, null);
+  assert.equal(b.crash, null);
+  assert.equal(a.events.at(-1).type, 'bump');
+  assert.equal(b.state.bumps, 1);
+  // apart again: no contact
+  assert.equal(bump(a, b), null);
+});
+
+test('contact: a hard hit takes both drones out, and they respawn and race on', () => {
+  const [a, b] = pair([0.3, 0, 0.3], [6, 0, 6], [-2, 0, -2]); // closing at ~11 m/s
+  const h = bump(a, b);
+  assert.ok(h.crash && h.closing > CONTACT.crashSpeed);
+  for (const s of [a, b]) {
+    assert.ok(s.crash, 'not crashed');
+    assert.equal(s.crash.what, 'drone');
+    assert.equal(s.state.crashes, 1);
+  }
+  // tumbling drones are ghosts: no more contact while they fall
+  assert.equal(bump(a, b), null);
+  for (let i = 0; i < 6 * 120; i++) { step(a, 1 / 120); step(b, 1 / 120); }
+  assert.ok(!a.crash && !b.crash && a.events.some((e) => e.type === 'respawn'));
+});
+
+test('contact: drones on the pad or holding at a respawn point are ghosts', () => {
+  const a = makeSim({ seed: 1, launchAt: 3 }), b = makeSim({ seed: 1, launchAt: 3 });
+  assert.equal(bump(a, b), null, 'touched on the pad'); // same spot, but nobody has launched
+  const [c, d] = pair([0, 0, 0.3], [0, 0, 5], [0, 0, 0]);
+  d.respawnAt = d.t + 0.5;
+  assert.equal(bump(c, d), null);
+});
+
+test('contact: the accelerometer feels a bump, so visual-inertial nav keeps up with it', () => {
+  const a = makeSim({ seed: 2, nav: 'vio' }), b = makeSim({ seed: 2 });
+  for (let i = 0; i < 6 * 120; i++) { step(a, 1 / 120); step(b, 1 / 120); }
+  const ev = () => [a.est.x[3], a.est.x[4], a.est.x[5]];
+  // b comes in from the side, so a gets knocked sideways
+  const side = v3.norm([a.drone.vel[2], 0, -a.drone.vel[0]]);
+  b.drone.pos = v3.add(a.drone.pos, v3.scale(side, 0.5));
+  b.drone.vel = v3.add(a.drone.vel, v3.scale(side, -4));
+  const est0 = v3.sub(ev(), a.drone.vel);
+  const h = bump(a, b);
+  assert.ok(h && !h.crash);
+  step(a, 1 / 120);
+  // the estimated velocity took the same jolt as the real one (to within IMU noise)
+  const est1 = v3.sub(ev(), a.drone.vel);
+  assert.ok(v3.len(v3.sub(est1, est0)) < 0.3, `estimate missed the jolt by ${v3.len(v3.sub(est1, est0)).toFixed(2)} m/s`);
+});
+
+test('racecraft: with no traffic around, sharing traffic changes nothing', () => {
+  const a = makeSim({ seed: 3 }), b = makeSim({ seed: 3 });
+  for (let i = 0; i < 25 * 120; i++) { shareTraffic([a]); step(a, 1 / 120); step(b, 1 / 120); }
+  assert.deepEqual(a.traffic, []);
+  assert.deepEqual(a.drone.pos, b.drone.pos);
+  assert.deepEqual(a.state.laps, b.state.laps);
+});
+
+// A full field race, as the page runs it: everyone shares traffic, steps, then contacts.
+function fieldRace(seed, difficulty, { traffic = true, laps = RACE.laps, wind = 'off' } = {}) {
+  const start = 3;
+  const entries = [{ id: 'hero', name: 'Racing line', sim: makeSim({ seed, difficulty, wind, launchAt: start }) },
+    ...ROSTER.slice(1).map((r, k) => ({ id: r.id, name: r.name, sim: makeSim({ seed, difficulty, wind, ...r.opts, slot: k + 1, launchAt: start }) }))];
+  const sims = entries.map((e) => e.sim), n = sims[0].course.gates.length;
+  const field = makeField(entries, { laps, start });
+  let contacts = 0;
+  for (let i = 0; i < 150 * 120 && !field.over; i++) {
+    if (traffic) shareTraffic(sims);
+    for (const s of sims) step(s, 1 / 120);
+    contacts += bumpAll(sims).filter((h) => h.closing > 0.3).length;
+    if (i % 12 === 0) syncField(field, n);
+  }
+  syncField(field, n);
+  const crashes = sims.reduce((a, s) => a + s.state.crashes, 0), misses = sims.reduce((a, s) => a + s.state.misses, 0);
+  return { field, contacts, crashes, misses };
+}
+
+test('field race: five drones race three laps to a chequered flag, with a clean, sensible result', () => {
+  let contacts = 0, crashes = 0, contactsOff = 0;
+  const cases = [[1, 'normal'], [2, 'normal'], [4, 'normal'], [3, 'easy'], [5, 'hard'], [7, 'hard']];
+  for (const [seed, d] of cases) {
+    const r = fieldRace(seed, d);
+    const res = results(r.field);
+    assert.ok(r.field.over, `${d} ${seed}: race never ended`);
+    assert.equal(r.misses, 0, `${d} ${seed}: missed gates`);
+    assert.ok(res.every((x) => x.finished), `${d} ${seed}: not everyone finished`);
+    // the optimised line (with or without vision) wins, three full laps
+    assert.ok(['hero', 'vision'].includes(res[0].id), `${d} ${seed}: ${res[0].name} won`);
+    assert.equal(res[0].laps, 3);
+    assert.equal(res[0].gap, null);
+    // the old pursuit pilot is lapped and classified last, a lap down
+    const p = res.find((x) => x.id === 'pursuit');
+    assert.equal(p.pos, 5);
+    assert.ok(p.down >= 1 && p.laps === 3 - p.down);
+    // finish times go up down the order among drones on the winner's lap
+    const lead = res.filter((x) => !x.down);
+    for (let i = 1; i < lead.length; i++) assert.ok(lead[i].gap > 0 && lead[i].time > lead[i - 1].time);
+    contacts += r.contacts;
+    crashes += r.crashes;
+    contactsOff += fieldRace(seed, d, { traffic: false }).contacts;
+  }
+  // racecraft keeps them mostly apart: a handful of touches, and at most the odd crash
+  assert.ok(crashes <= 2, `${crashes} crashes in ${cases.length} races`);
+  assert.ok(contacts * 2 < contactsOff, `${contacts} contacts with racecraft, ${contactsOff} without`);
+});
+
+test('field race: in gusty wind the race still finishes cleanly', () => {
+  const r = fieldRace(11, 'normal', { wind: 'gusty', laps: 2 });
+  assert.ok(r.field.over && results(r.field).every((x) => x.finished));
+  assert.equal(r.misses, 0);
+  assert.ok(r.crashes <= 1);
+});
+
+test('field results: the flag, the rest finishing on their next lap, DNFs and gaps', () => {
+  // fake sims: N gates a lap, events pushed by hand
+  const N = 2;
+  const fake = () => ({ events: [], t: 0, crash: null, course: { gates: [0, 1] }, state: { lap: 0, laps: [] } });
+  const f = makeField(['a', 'b', 'c'].map((id) => ({ id, name: id.toUpperCase(), sim: fake() })), { laps: 2, start: 1 });
+  const [A, B, C] = f.entries.map((e) => e.sim);
+  const gate = (s, t, g) => { s.events.push({ t, type: 'gate', gate: g }); s.t = t; };
+  // everyone crosses the start line, then A laps faster than B; C is slow
+  for (const s of [A, B, C]) gate(s, 2, 0);
+  gate(A, 3, 1); gate(A, 4, 0); gate(A, 5, 1); gate(A, 6, 0); // A: 2 laps at t=6
+  gate(B, 3.5, 1); gate(B, 5, 0); gate(B, 6.2, 1);
+  gate(C, 5, 1);
+  syncField(f, N);
+  assert.equal(f.flag, 6);
+  assert.deepEqual(f.order, ['a']);
+  assert.ok(!f.over);
+  gate(B, 7, 0); // B takes the flag on its next crossing, a full 2 laps
+  gate(C, 7.5, 0); // C crosses after 1 lap: finished, a lap down
+  syncField(f, N);
+  assert.ok(f.over);
+  let res = results(f);
+  assert.deepEqual(res.map((r) => r.id), ['a', 'b', 'c']);
+  assert.equal(res[0].time, 5); // from the green light at t=1
+  assert.ok(Math.abs(res[1].gap - 1) < 1e-9);
+  assert.equal(res[2].down, 1);
+  assert.equal(res[2].gap, null);
+  // after the flag, a drone that never gets back to the line is a DNF once the timeout passes
+  const g = makeField(['a', 'b'].map((id) => ({ id, name: id, sim: fake() })), { laps: 1 });
+  const [P, Q] = g.entries.map((e) => e.sim);
+  gate(P, 1, 0); gate(Q, 1, 0); gate(P, 2, 1); gate(P, 3, 0);
+  syncField(g, N);
+  assert.ok(!g.over);
+  Q.t = 3 + RACE.timeout;
+  syncField(g, N);
+  assert.ok(g.over);
+  res = results(g);
+  assert.equal(res[1].finished, false);
+  assert.equal(res[0].id, 'a');
 });
