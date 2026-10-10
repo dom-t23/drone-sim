@@ -2,7 +2,7 @@
 // each) and gate split times against the best lap. Rendering only; the numbers come from
 // the sim, sampled by main.js.
 
-import { G, DRONE, v3 } from './sim.js';
+import { G, DRONE, v3, navError } from './sim.js';
 import { makeSplits, splitsOnEvent } from './splits.js';
 
 const WINDOW = 10; // s shown
@@ -17,6 +17,9 @@ const CHARTS = [
   { key: 'tilt', title: 'Tilt', unit: '°', max: 60, fmt: (v) => v.toFixed(0), limit: (DRONE.maxTiltRad * 180) / Math.PI },
   { key: 'thrust', title: 'Thrust', unit: 'g', max: 3, fmt: (v) => v.toFixed(2), limit: DRONE.maxThrustAcc / G },
   { key: 'err', title: 'Off the line', unit: 'm', max: 1.5, fmt: (v) => v.toFixed(2) },
+  // visual-inertial nav only: how far out the position estimate is, against the filter's
+  // own 2-sigma bound (dashed). A healthy filter stays mostly under its bound.
+  { key: 'nav', title: 'Position error', unit: 'm', max: 1, fmt: (v) => v.toFixed(2), plan: 'navBound', note: 'dashed: 2σ', est: true },
 ];
 
 export function makeTelemetry(root) {
@@ -25,7 +28,7 @@ export function makeTelemetry(root) {
     <div class="tm-legend"><span class="sw" style="background:${ACTUAL}"></span>actual
       <span class="sw dash" style="border-color:${PLAN}"></span>plan
       <span class="sw dash" style="border-color:${LIMIT}"></span>limit</div>
-    ${CHARTS.map((c) => `<div class="tm-head"><span>${c.title} <i>0–${c.max} ${c.unit}</i></span><b id="tm-${c.key}">–</b></div><canvas class="tm-chart"></canvas>`).join('')}
+    ${CHARTS.map((c) => `<div data-chart="${c.key}"><div class="tm-head"><span>${c.title} <i>0–${c.max} ${c.unit}${c.note ? `, ${c.note}` : ''}</i></span><b id="tm-${c.key}">–</b></div><canvas class="tm-chart"></canvas></div>`).join('')}
     <div class="tm-head tm-splits-head"><span>Splits</span><b id="tm-best">best –</b></div>
     <div class="tm-splits" id="tm-splits"></div>`;
   T.canvases = [...root.querySelectorAll('canvas')];
@@ -53,14 +56,25 @@ export function sampleTelemetry(T, sim) {
     tilt: (Math.acos(Math.min(1, d.thrust[1] / (thrust || 1))) * 180) / Math.PI,
     thrust: thrust / G,
     err: racing ? v3.len(v3.sub(q.p, d.pos)) : null,
+    ...navSample(sim),
   });
   while (T.samples.length && T.samples[0].t < sim.t - WINDOW) T.samples.shift();
+}
+
+function navSample(sim) {
+  const n = sim.crash ? null : navError(sim);
+  return { nav: n ? n.err : null, navBound: n ? 2 * n.sigma : null };
 }
 
 export function drawTelemetry(T, sim) {
   for (; T.events < sim.events.length; T.events++) splitsOnEvent(T.splits, sim.events[T.events]);
   const last = T.samples.at(-1);
   CHARTS.forEach((c, i) => {
+    if (c.est) {
+      const box = T.root.querySelector(`[data-chart="${c.key}"]`);
+      box.hidden = !sim.est;
+      if (box.hidden) return;
+    }
     const el = T.root.querySelector(`#tm-${c.key}`);
     el.textContent = last && last[c.key] != null ? `${c.fmt(last[c.key])} ${c.unit}` : '–';
     drawChart(T.canvases[i], c, T.samples, sim.t);

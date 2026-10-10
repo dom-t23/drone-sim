@@ -406,7 +406,7 @@ function nearestIndex(plan, pos, from, back = 20, fwd = 160) {
 // Track the racing line: feedforward from the path (centripetal + along-track
 // acceleration + drag), plus PD on position and velocity error.
 export function racingPilot(sim) {
-  const { drone, plan, track } = sim;
+  const { plan, track } = sim, drone = navState(sim);
   const P = plan.params;
   const N = plan.pts.length;
   track.idx = nearestIndex(plan, drone.pos, track.idx);
@@ -436,7 +436,7 @@ export function racingPilot(sim) {
 // the estimates move, the racing line is re-planned through them in flight. The drone's
 // own position and attitude are still taken as known: estimating those is step 2.
 
-export const NAV_MODES = ['truth', 'vision', 'blind'];
+export const NAV_MODES = ['truth', 'vision', 'vio', 'blind'];
 
 export const CAMERA = {
   vfov: 85 * DEG, // vertical field of view, same as the rendered onboard camera
@@ -475,6 +475,19 @@ const VISION = {
 // Pose of the onboard camera: forward, up and image-right axes plus position, built the
 // same way the renderer orients the drone (yaw, then tilt the body up axis onto the thrust).
 export function cameraPose(drone) {
+  const { bx, by, bz } = bodyAxes(drone);
+  const ca = Math.cos(CAMERA.tilt), sa = Math.sin(CAMERA.tilt), m = CAMERA.mount;
+  const mix = (a, wa, b, wb) => [a[0] * wa + b[0] * wb, a[1] * wa + b[1] * wb, a[2] * wa + b[2] * wb];
+  return {
+    pos: v3.add(drone.pos, v3.add(v3.scale(bx, m[0]), mix(by, m[1], bz, m[2]))),
+    fwd: mix(by, sa, bz, ca),
+    up: mix(by, ca, bz, -sa),
+    right: v3.scale(bx, -1), // the camera looks out of the nose, so image right is body -x
+  };
+}
+
+// The body axes in world coordinates (x left, y up along the thrust, z out of the nose).
+export function bodyAxes(drone) {
   const t = v3.norm(drone.thrust), c = t[1];
   const tilt = (v) => {
     // rotate v by the minimal rotation taking world up onto t (axis up x t)
@@ -484,15 +497,7 @@ export function cameraPose(drone) {
     return [v[0] * c + kx[0] + k[0] * f, v[1] * c + kx[1] + k[1] * f, v[2] * c + kx[2] + k[2] * f];
   };
   const cy = Math.cos(drone.yaw), sy = Math.sin(drone.yaw);
-  const bx = tilt([cy, 0, -sy]), by = t, bz = tilt([sy, 0, cy]);
-  const ca = Math.cos(CAMERA.tilt), sa = Math.sin(CAMERA.tilt), m = CAMERA.mount;
-  const mix = (a, wa, b, wb) => [a[0] * wa + b[0] * wb, a[1] * wa + b[1] * wb, a[2] * wa + b[2] * wb];
-  return {
-    pos: v3.add(drone.pos, v3.add(v3.scale(bx, m[0]), mix(by, m[1], bz, m[2]))),
-    fwd: mix(by, sa, bz, ca),
-    up: mix(by, ca, bz, -sa),
-    right: v3.scale(bx, -1), // the camera looks out of the nose, so image right is body -x
-  };
+  return { bx: tilt([cy, 0, -sy]), by: t, bz: tilt([sy, 0, cy]) };
 }
 
 // Image-plane coordinates (x/z, y/z) of a world point, or null if it is behind the camera.
@@ -709,6 +714,8 @@ function fuse(b, z, C) {
 // One camera frame: detect, fit, gate, fuse, and re-plan if the picture has changed.
 function visionFrame(sim) {
   const V = sim.vision, C = CAMERA, cam = cameraPose(sim.drone);
+  // the camera sees from where the drone really is; the fits are made from where it thinks it is
+  const camEst = sim.est ? cameraPose(navState(sim)) : cam;
   const tanV = Math.tan(C.vfov / 2), tanH = tanV * C.aspect, px = (2 * tanV) / C.heightPx;
   const dets = [];
   for (const g of sim.course.gates) {
@@ -738,8 +745,8 @@ function visionFrame(sim) {
       q[1] += (V.rand() < 0.5 ? -1 : 1) * C.outlierPx * px;
     }
     const b = sim.belief.gates[g.id];
-    const fit = solveGatePose(cam, uv, b, C.noisePx * px);
-    const ok = !!fit && fit.chi2 < VISION.chi2Fit && fuse(b, fit.pos, fit.cov);
+    const fit = solveGatePose(camEst, uv, b, C.noisePx * px);
+    const ok = !!fit && fit.chi2 < VISION.chi2Fit && (sim.est ? fuseLandmark(sim, g.id, fit) : fuse(b, fit.pos, fit.cov));
     V.stats[ok ? 'accepted' : 'rejected']++;
     if (wild) V.stats.wild++;
     if (wild && !ok) V.stats.wildRejected++;
@@ -753,6 +760,7 @@ function visionFrame(sim) {
   }
   V.frame = { t: sim.t, dets };
   V.stats.frames++;
+  if (sim.est) syncBelief(sim);
   // after the first lap every gate has been seen: re-shape the line for the real course
   if (sim.shape && !V.reshaped && sim.state.laps.length >= 1) {
     sim.shape = optimiseLine(sim.belief, null, { start: sim.shape, rounds: 2, stepScale: 0.5, plan: sim.planOpts });
@@ -770,11 +778,232 @@ function replan(sim) {
   const V = sim.vision, s = sim.plan.pts[sim.track.idx].s;
   const plan = planRacingLine(sim.belief, { ...sim.planOpts, shape: sim.shape });
   sim.plan = plan;
-  sim.track.idx = nearestIndex(plan, sim.drone.pos, Math.round(s / plan.ds) % plan.pts.length, 60, 60);
+  sim.track.idx = nearestIndex(plan, navState(sim).pos, Math.round(s / plan.ds) % plan.pts.length, 60, 60);
   sim.planVersion++;
   V.planned = sim.belief.gates.map((b) => b.pos.slice());
   V.lastPlan = sim.t;
   V.stats.replans++;
+}
+
+// A PnP fit as an EKF measurement: the gate centre relative to the drone. The fit was made
+// from the camera at the estimated position, so subtracting that position leaves what the
+// camera actually measured. Like fuse(), a run of rejections restarts the gate.
+function fuseLandmark(sim, id, fit) {
+  const E = sim.est, j = 9 + 3 * id;
+  const z = [fit.pos[0] - E.x[0], fit.pos[1] - E.x[1], fit.pos[2] - E.x[2]];
+  const ok = ekfUpdate(E, z, m3.scale(fit.cov, VIO.inflate), j, 0, VISION.chi2Gate);
+  const b = sim.belief.gates[id];
+  if (ok) {
+    E.stats.updates++;
+    b.streak = 0;
+  } else {
+    E.stats.rejected++;
+    if (++b.streak >= VISION.resetAfter) {
+      ekfReset(E, j, fit.pos, MAP_ERROR.sigma ** 2);
+      E.stats.resets++;
+      b.streak = 0;
+    }
+  }
+  return ok;
+}
+
+// ---------- visual-inertial navigation ----------
+// Vision mode, step 2 ('vio'). Now the drone doesn't know where it is either. Its only
+// motion sensor is an accelerometer: specific force in the body frame, with white noise
+// and a bias that is different for every drone and wanders slowly. Integrating it twice
+// (dead reckoning) drifts off by metres within seconds. An extended Kalman filter fixes
+// that by treating every gate the camera sees as a landmark: one joint state holds the
+// drone's position, velocity and accelerometer bias AND every gate's position, so a gate
+// detection corrects the drone and the map together (EKF-SLAM). Attitude is still taken
+// as known, as if from a well-tuned gyro and attitude filter, which makes the model
+// linear: the "extended" part only bites in the PnP fits that feed it.
+//
+// State x = [p(3), v(3), b(3), g_0(3) ... g_N-1(3)], world frame, b in the body frame.
+//   predict:  v += (R (f - b) - g) dt,  p += v dt,  b and the gates stay put
+//   measure:  z = g_i - p  (gate centre relative to the drone, from PnP), or v = 0 on the pad
+export const IMU = {
+  noise: 0.03, // accelerometer white noise density, m/s^2/sqrt(Hz) (motor vibration included)
+  bias: 0.3, // m/s^2: each axis's bias is drawn from +-this...
+  biasWalk: 0.004, // ...and wanders by this much, m/s^2/sqrt(s)
+};
+export const VIO = {
+  padSigma: 0.05, // m: the start pad is surveyed, so the drone knows where it starts
+  zupt: 0.01, // m/s: zero-velocity updates while held on the pad (it knows it isn't moving)
+  lookFirst: 1.0, // s on the pad: long enough for the zero-velocity updates to find the bias
+  respawnSigma: 0.3, // m: after a crash the drone is put back roughly where it should be
+  // PnP covariance inflation. Higher than vision's: pixel noise makes far-off fits slightly
+  // biased (range from apparent size is a 1/x), and with the drone's own position in the
+  // state that bias no longer averages out over many sightings of a static gate
+  inflate: 3,
+};
+
+function makeEstimator(sim, seed) {
+  const nG = sim.course.gates.length, n = 9 + 3 * nG;
+  const rand = mulberry32((seed * 15485863 + 11) | 0);
+  const P = new Float64Array(n * n);
+  const x = new Float64Array(n);
+  const d = sim.drone;
+  for (let k = 0; k < 3; k++) {
+    x[k] = d.pos[k];
+    P[k * n + k] = VIO.padSigma ** 2;
+    P[(3 + k) * n + 3 + k] = 0.01 ** 2;
+    P[(6 + k) * n + 6 + k] = (IMU.bias / Math.sqrt(3)) ** 2; // uniform +-bias
+  }
+  sim.belief.gates.forEach((b, i) => {
+    for (let k = 0; k < 3; k++) {
+      const j = 9 + 3 * i + k;
+      x[j] = b.pos[k];
+      P[j * n + j] = MAP_ERROR.sigma ** 2;
+    }
+  });
+  return {
+    n, x, P, rand,
+    bias: [0, 1, 2].map(() => (rand() * 2 - 1) * IMU.bias), // the true bias (body frame)
+    f: [0, G, 0], // last accelerometer reading, body frame
+    // dead reckoning alone from the same readings, restarted at each lap from the filter's
+    // estimate (bias included): where the drone would think it was if the camera went dark
+    dr: { p: d.pos.slice(), v: [0, 0, 0], b: [0, 0, 0] },
+    stats: { updates: 0, rejected: 0, resets: 0, zupts: 0 },
+  };
+}
+
+// World-frame acceleration from the last accelerometer reading, bias-corrected.
+function imuAccel(sim) {
+  const { bx, by, bz } = bodyAxes(sim.drone), { f, x } = sim.est;
+  const fc = [f[0] - x[6], f[1] - x[7], f[2] - x[8]];
+  return [
+    bx[0] * fc[0] + by[0] * fc[1] + bz[0] * fc[2],
+    bx[1] * fc[0] + by[1] * fc[1] + bz[1] * fc[2] - G,
+    bx[2] * fc[0] + by[2] * fc[1] + bz[2] * fc[2],
+  ];
+}
+
+// The drone's navigation state: what its pilots steer by.
+function navState(sim) {
+  if (!sim.est) return sim.drone;
+  const x = sim.est.x;
+  return { pos: [x[0], x[1], x[2]], vel: [x[3], x[4], x[5]], thrust: sim.drone.thrust, yaw: sim.drone.yaw };
+}
+
+// P <- T P T' for T = I + (M at rows a, columns b): the state block a gains M times block b.
+function lin3(P, n, a, b, M) {
+  for (let c = 0; c < n; c++) {
+    const u = P[b * n + c], v = P[(b + 1) * n + c], w = P[(b + 2) * n + c];
+    P[a * n + c] += M[0] * u + M[1] * v + M[2] * w;
+    P[(a + 1) * n + c] += M[3] * u + M[4] * v + M[5] * w;
+    P[(a + 2) * n + c] += M[6] * u + M[7] * v + M[8] * w;
+  }
+  for (let r = 0; r < n; r++) {
+    const u = P[r * n + b], v = P[r * n + b + 1], w = P[r * n + b + 2];
+    P[r * n + a] += M[0] * u + M[1] * v + M[2] * w;
+    P[r * n + a + 1] += M[3] * u + M[4] * v + M[5] * w;
+    P[r * n + a + 2] += M[6] * u + M[7] * v + M[8] * w;
+  }
+}
+
+// One IMU sample and the filter's prediction step. acc is the drone's true acceleration
+// this step (whatever caused it: thrust, drag, the pad, the ground).
+function imuStep(sim, acc, dt) {
+  const E = sim.est, { x, P, n } = E, d = sim.drone;
+  const { bx, by, bz } = bodyAxes(d);
+  // R takes body to world: its columns are the body axes
+  const R = [bx[0], by[0], bz[0], bx[1], by[1], bz[1], bx[2], by[2], bz[2]];
+  const fw = [acc[0], acc[1] + G, acc[2]]; // specific force, world frame
+  const sd = IMU.noise / Math.sqrt(dt);
+  for (let k = 0; k < 3; k++) E.bias[k] += gauss(E.rand) * IMU.biasWalk * Math.sqrt(dt);
+  E.f = [
+    v3.dot(bx, fw) + E.bias[0] + gauss(E.rand) * sd,
+    v3.dot(by, fw) + E.bias[1] + gauss(E.rand) * sd,
+    v3.dot(bz, fw) + E.bias[2] + gauss(E.rand) * sd,
+  ];
+  const fc = [E.f[0] - x[6], E.f[1] - x[7], E.f[2] - x[8]];
+  const a = m3.mulv(R, fc);
+  a[1] -= G;
+  for (let k = 0; k < 3; k++) {
+    x[3 + k] += a[k] * dt;
+    x[k] += x[3 + k] * dt;
+  }
+  // covariance: v' = v - R b dt, then p' = p + v' dt (the same order as the state)
+  lin3(P, n, 3, 6, R.map((r) => -r * dt));
+  lin3(P, n, 0, 3, [dt, 0, 0, 0, dt, 0, 0, 0, dt]);
+  const qv = IMU.noise ** 2 * dt, qb = IMU.biasWalk ** 2 * dt;
+  for (let k = 0; k < 3; k++) {
+    P[(3 + k) * n + 3 + k] += qv;
+    P[(6 + k) * n + 6 + k] += qb;
+  }
+  // the dead-reckoning comparison, flying on the same readings
+  const D = E.dr, ad = m3.mulv(R, [E.f[0] - D.b[0], E.f[1] - D.b[1], E.f[2] - D.b[2]]);
+  ad[1] -= G;
+  D.v = v3.add(D.v, v3.scale(ad, dt));
+  D.p = v3.add(D.p, v3.scale(D.v, dt));
+}
+
+// Kalman update with a 3-vector measurement z = H x + noise (covariance Rm), where H picks
+// +state block `plus` and, optionally, -state block `minus`. Rejects the measurement if
+// it fails the chi-square gate. Returns whether it was used.
+function ekfUpdate(E, z, Rm, plus, minus = -1, gate = Infinity) {
+  const { x, P, n } = E;
+  // PH' (n x 3) and the predicted measurement
+  const PH = new Float64Array(n * 3);
+  for (let r = 0; r < n; r++) {
+    for (let k = 0; k < 3; k++) PH[r * 3 + k] = P[r * n + plus + k] - (minus >= 0 ? P[r * n + minus + k] : 0);
+  }
+  const S = new Array(9), y = new Array(3);
+  for (let a = 0; a < 3; a++) {
+    y[a] = z[a] - x[plus + a] + (minus >= 0 ? x[minus + a] : 0);
+    for (let b = 0; b < 3; b++) {
+      S[a * 3 + b] = PH[(plus + a) * 3 + b] - (minus >= 0 ? PH[(minus + a) * 3 + b] : 0) + Rm[a * 3 + b];
+    }
+  }
+  const Si = m3.inv(S);
+  if (!Si) return false;
+  if (v3.dot(y, m3.mulv(Si, y)) > gate) return false;
+  // K = PH' S^-1, x += K y, P -= K S K' = K (PH')'
+  const K = new Float64Array(n * 3);
+  for (let r = 0; r < n; r++) {
+    const h = [PH[r * 3], PH[r * 3 + 1], PH[r * 3 + 2]];
+    for (let k = 0; k < 3; k++) K[r * 3 + k] = h[0] * Si[k] + h[1] * Si[3 + k] + h[2] * Si[6 + k];
+    x[r] += K[r * 3] * y[0] + K[r * 3 + 1] * y[1] + K[r * 3 + 2] * y[2];
+  }
+  for (let r = 0; r < n; r++) {
+    for (let c = r; c < n; c++) {
+      const v = P[r * n + c] - (K[r * 3] * PH[c * 3] + K[r * 3 + 1] * PH[c * 3 + 1] + K[r * 3 + 2] * PH[c * 3 + 2]);
+      P[r * n + c] = P[c * n + r] = v;
+    }
+  }
+  return true;
+}
+
+// Copy the filter's gate estimates into the belief the planner and the overlay use.
+function syncBelief(sim) {
+  const { x, P, n } = sim.est;
+  sim.belief.gates.forEach((b, i) => {
+    const j = 9 + 3 * i;
+    b.pos = [x[j], x[j + 1], x[j + 2]];
+    b.cov = [0, 1, 2].flatMap((r) => [0, 1, 2].map((c) => P[(j + r) * n + j + c]));
+  });
+}
+
+// Forget everything the filter knew linking state block j to the rest and restart it
+// at value z with variance s2 (a gate that has gone wrong, or the drone after a crash).
+function ekfReset(E, j, z, s2, len = 3) {
+  const { x, P, n } = E;
+  for (let k = j; k < j + len; k++) {
+    for (let c = 0; c < n; c++) P[k * n + c] = P[c * n + k] = 0;
+    P[k * n + k] = s2;
+    x[k] = z[k - j];
+  }
+}
+
+// Position error of the estimate and its 1-sigma size (sqrt of the trace), for the HUD.
+export function navError(sim) {
+  if (!sim.est) return null;
+  const { x, P, n } = sim.est, d = sim.drone.pos;
+  return {
+    err: Math.hypot(x[0] - d[0], x[1] - d[1], x[2] - d[2]),
+    sigma: Math.sqrt(P[0] + P[n + 1] + P[2 * n + 2]),
+    dr: v3.len(v3.sub(sim.est.dr.p, d)),
+  };
 }
 
 // ---------- wind ----------
@@ -1038,6 +1267,13 @@ function respawn(sim) {
   d.vel = [0, 0, 0];
   d.thrust = [0, G, 0];
   delete d.tumble;
+  if (sim.est) {
+    // put back by hand: roughly where it should be, and not moving
+    const E = sim.est, off = [0, 1, 2].map(() => gauss(E.rand) * VIO.respawnSigma * 0.5);
+    ekfReset(E, 0, v3.add(d.pos, off), VIO.respawnSigma ** 2);
+    ekfReset(E, 3, [0, 0, 0], 0.05 ** 2);
+    E.dr = { p: [E.x[0], E.x[1], E.x[2]], v: [0, 0, 0], b: [E.x[6], E.x[7], E.x[8]] };
+  }
   sim.track.idx = nearestIndex(plan, d.pos, 0, 0, N);
   sim.crash = null;
   sim.respawnAt = sim.t + CRASH.hold;
@@ -1061,6 +1297,7 @@ export function makeSim({ seed = 1, gates, pilot = 'racing', difficulty = 'norma
   const course = makeCourse({ seed, gates, difficulty });
   if (!NAV_MODES.includes(nav)) nav = 'truth';
   const belief = nav === 'truth' ? null : makeMap(course, seed);
+  const camera = nav === 'vision' || nav === 'vio';
   const drone = makeDrone(course);
   // the racing pilot flies an optimised line; vision keeps its shape through re-plans
   if (!WIND_MODES.includes(wind)) wind = 'off';
@@ -1086,7 +1323,7 @@ export function makeSim({ seed = 1, gates, pilot = 'racing', difficulty = 'norma
     drone.pos[0] += Math.cos(drone.yaw) * side;
     drone.pos[2] -= Math.sin(drone.yaw) * side;
   }
-  return {
+  const sim = {
     // map-only flies through frames like a ghost run, so you can watch every miss
     crashes: crashes ?? nav !== 'blind',
     scenery: makeScenery(course, seed),
@@ -1098,7 +1335,7 @@ export function makeSim({ seed = 1, gates, pilot = 'racing', difficulty = 'norma
     pilot,
     nav,
     belief, // what the drone believes about the gates (null: it knows the truth)
-    vision: nav === 'vision' ? {
+    vision: camera ? {
       rand: mulberry32((seed * 104729 + 7) | 0),
       clock: 0,
       frame: null, // latest detections, for the onboard overlay
@@ -1115,13 +1352,15 @@ export function makeSim({ seed = 1, gates, pilot = 'racing', difficulty = 'norma
     observer,
     planVersion: 0,
     // vision takes a look before it goes; a race against a human starts on a countdown
-    launchAt: launchAt ?? (nav === 'vision' ? VISION.lookFirst : 0),
+    launchAt: launchAt ?? (nav === 'vio' ? VIO.lookFirst : nav === 'vision' ? VISION.lookFirst : 0),
     stick: { x: 0, y: 0, z: 0, s: 0 }, // manual pilot's inputs
     track: { idx: nearestIndex(plan, drone.pos, 0, 0, plan.pts.length) },
     t: 0,
     state: { target: 0, gatesPassed: 0, misses: 0, crashes: 0, lap: 0, lapStart: null, laps: [] },
     events: [],
   };
+  sim.est = nav === 'vio' ? makeEstimator(sim, seed) : null; // visual-inertial navigation filter
+  return sim;
 }
 
 export function step(sim, dt) {
@@ -1129,7 +1368,7 @@ export function step(sim, dt) {
   const { drone, course, state } = sim;
   const want =
     sim.t < sim.launchAt || sim.t < sim.respawnAt ? [0, G, 0] // on the pad, or just respawned
-      : sim.pilot === 'pursuit' ? autopilot(drone, sim.belief ?? course, state)
+      : sim.pilot === 'pursuit' ? autopilot(navState(sim), sim.belief ?? course, state)
         : sim.pilot === 'manual' ? manualPilot(sim, dt)
           : racingPilot(sim);
   // cancel the disturbance the observer has measured (wind, mostly)
@@ -1154,11 +1393,23 @@ export function step(sim, dt) {
     if (drone.vel[1] < 0) drone.vel[1] = 0;
     grounded = true;
   }
+  let navVel = vPrev;
+  if (sim.est) {
+    navVel = [sim.est.x[3], sim.est.x[4], sim.est.x[5]];
+    imuStep(sim, v3.scale(v3.sub(drone.vel, vPrev), 1 / dt), dt);
+    if (onPad) {
+      // held on the pad: it knows it isn't moving, which pins down the accelerometer bias
+      ekfUpdate(sim.est, [0, 0, 0], m3.diag(VIO.zupt ** 2), 3);
+      sim.est.stats.zupts++;
+    }
+  }
   if (sim.wind) {
-    // observer: measured acceleration minus what the still-air model predicts, low-passed
+    // observer: measured acceleration minus what the still-air model predicts, low-passed.
+    // With visual-inertial nav that is the bias-corrected accelerometer and the estimated
+    // velocity; otherwise the true motion.
     if (!grounded) {
-      const seen = v3.scale(v3.sub(drone.vel, vPrev), 1 / dt);
-      const model = v3.sub(v3.sub(drone.thrust, [0, G, 0]), v3.scale(vPrev, DRONE.drag));
+      const seen = sim.est ? imuAccel(sim) : v3.scale(v3.sub(drone.vel, vPrev), 1 / dt);
+      const model = v3.sub(v3.sub(drone.thrust, [0, G, 0]), v3.scale(navVel, DRONE.drag));
       sim.dist = v3.add(sim.dist, v3.scale(v3.sub(v3.sub(seen, model), sim.dist), Math.min(1, dt / WIND.observerTau)));
     }
     stepWind(sim.wind, dt);
@@ -1184,6 +1435,11 @@ export function step(sim, dt) {
       state.gatesPassed++;
       sim.events.push({ t: sim.t, type: 'gate', gate: gate.id });
       if (gate.id === 0) {
+        if (sim.est) {
+          // restart the dead-reckoning comparison from the filter's estimate
+          const x = sim.est.x;
+          sim.est.dr = { p: [x[0], x[1], x[2]], v: [x[3], x[4], x[5]], b: [x[6], x[7], x[8]] };
+        }
         if (state.lapStart !== null) {
           const lt = sim.t - state.lapStart;
           state.laps.push(lt);

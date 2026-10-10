@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { makeSim, step, GATE_INNER, v3, DIFFICULTIES, NAV_MODES, WIND_MODES, PILOTS, DRONE } from './sim.js';
+import { makeSim, step, GATE_INNER, v3, DIFFICULTIES, NAV_MODES, WIND_MODES, PILOTS, DRONE, navError } from './sim.js';
 import { makeRace, syncRace, raceGap } from './race.js';
 import { makeGhostRecorder, recordGhost, ghostPose, encodeGhost, decodeGhost } from './ghost.js';
 import { makeTelemetry, resetTelemetry, sampleTelemetry, drawTelemetry } from './telemetry.js';
@@ -532,6 +532,39 @@ function updateGhost() {
   if (ghostMesh.visible) syncMesh(ghostMesh, pose);
 }
 
+// Visual-inertial nav: where the drone thinks it is (a magenta wire ball, radius two sigma,
+// joined to the real drone by a line) and where the IMU alone would put it (red, joined to
+// the drone by a dashed line). Chase view only (layer 1), so they never fill the onboard view.
+const estMat = new THREE.MeshBasicMaterial({ color: '#ff4fd8', wireframe: true, transparent: true, opacity: 0.8, depthTest: false });
+const estMesh = new THREE.Mesh(new THREE.SphereGeometry(1, 12, 8), estMat);
+const drMesh = new THREE.Mesh(new THREE.SphereGeometry(0.35, 12, 8), new THREE.MeshBasicMaterial({ color: '#ff5c5c', transparent: true, opacity: 0.9, depthTest: false }));
+const estLinePos = new Float32Array(12);
+const estLineGeo = new THREE.BufferGeometry();
+estLineGeo.setAttribute('position', new THREE.BufferAttribute(estLinePos, 3));
+const estLine = new THREE.LineSegments(estLineGeo, new THREE.LineBasicMaterial({ color: '#ff8fe6', transparent: true, opacity: 0.8, depthTest: false }));
+estLine.frustumCulled = false;
+for (const o of [estMesh, drMesh, estLine]) {
+  o.layers.set(1);
+  o.renderOrder = 11;
+  o.visible = false;
+  scene.add(o);
+}
+chaseCam.layers.enable(1);
+function updateEstimate() {
+  const vs = viewSim(), E = vs.est, on = !!E && !vs.crash;
+  estMesh.visible = drMesh.visible = estLine.visible = on;
+  if (!on) return;
+  const n = navError(vs), p = vs.drone.pos, x = E.x;
+  estMesh.position.set(x[0], x[1], x[2]);
+  estMesh.scale.setScalar(Math.max(0.3, 2 * n.sigma));
+  drMesh.position.set(...E.dr.p);
+  estLinePos.set(p, 0);
+  estLinePos.set([x[0], x[1], x[2]], 3);
+  estLinePos.set(p, 6);
+  estLinePos.set(E.dr.p, 9);
+  estLineGeo.attributes.position.needsUpdate = true;
+}
+
 // onboard camera mounted on the nose, tilted up like a real FPV cam
 const camMount = new THREE.Object3D();
 camMount.position.set(0, 0.06, 0.2);
@@ -695,6 +728,11 @@ function updateHud(force) {
     const mapErr = v3.len(v3.sub(b.mapPos, g.pos)), estErr = v3.len(v3.sub(b.pos, g.pos));
     $('s-vis').textContent = sim.vision ? `${mapErr.toFixed(1)} → ${estErr.toFixed(2)} m` : `${mapErr.toFixed(1)} m out`;
   }
+  // visual-inertial nav: how far out the drone's own position estimate is, and how far
+  // out the IMU alone would be by now (since the start of the lap)
+  const vs = viewSim(), ne = vs.crash ? null : navError(vs);
+  $('r-nav').hidden = $('s-nav').hidden = !vs.est;
+  if (vs.est) $('s-nav').textContent = ne ? `${ne.err.toFixed(2)} m · IMU ${ne.dr < 10 ? ne.dr.toFixed(1) : ne.dr.toFixed(0)} m` : '–';
   // wind: what is really blowing, and what the drone's observer reckons
   $('r-wind').hidden = $('s-wind').hidden = !sim.wind;
   if (sim.wind) {
@@ -766,6 +804,7 @@ function toast(msg, bad = false) {
 // A short note on what the nav mode shows, faded out after a while.
 const NAV_NOTES = {
   vision: '<b>Vision.</b> The drone\'s map has every gate up to 2.6 m out. Its camera finds the real gates (corner boxes in the onboard view) and it re-plans through its estimates (cyan).',
+  vio: '<b>Vision + IMU.</b> Now the drone doesn\'t know where <i>it</i> is either: just a noisy, biased accelerometer and the camera. A Kalman filter estimates its position (magenta ball, 2σ) and every gate together. The red ball is the IMU alone: it drifts metres off every lap.',
   blind: '<b>Map only.</b> The drone trusts a map with every gate up to 2.6 m out (cyan), so it misses gates. As a ghost run, it flies straight through any frame it meets.',
 };
 const coarse = matchMedia('(pointer: coarse)').matches;
@@ -844,7 +883,7 @@ $('b-share').onclick = () => {
     navigator.clipboard.writeText(url).then(() => toast('Link copied'), () => toast(location.hash));
   } else toast(location.hash);
 };
-const NAV_LABELS = { truth: 'ground truth', vision: 'vision', blind: 'map only' };
+const NAV_LABELS = { truth: 'ground truth', vision: 'vision', vio: 'vision + IMU', blind: 'map only' };
 function syncButtons() {
   $('b-diff').textContent = `Course: ${difficulty}`;
   $('b-nav').textContent = `Nav: ${NAV_LABELS[nav]}`;
@@ -1102,6 +1141,7 @@ function frame(now) {
   if (field) updateField();
   if (rival || field) updateCountdown();
   updateGhost();
+  updateEstimate();
   updateStreaks(steps * DT);
   updateDebris(steps * DT);
   updateWash(steps * DT);

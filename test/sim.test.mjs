@@ -5,6 +5,7 @@ import {
   makeSim, step, planRacingLine, makeCourse, v3, GATE_INNER, DRONE, G, DIFFICULTIES,
   cameraPose, project, gateCorners, solveGatePose, CAMERA, optimiseLine, SHAPING, WIND,
   MANUAL, headingAxes, CRASH, FRAME, collide, makeScenery, gridOffset, GRID,
+  NAV_MODES, IMU, VIO, navError, bodyAxes,
 } from '../src/sim.js';
 import { ROSTER, rosterFor, makeField, syncField, standings, gapText } from '../src/field.js';
 import { makeRace, syncRace, raceGap } from '../src/race.js';
@@ -987,4 +988,147 @@ test('fx: wash and motor tone stay finite through 40 s of gusty flight on a hard
     assert.ok([t.freq, t.gain, t.air].every(Number.isFinite));
   }
   assert.ok([...w.pos].every(Number.isFinite) && [...w.vel].every(Number.isFinite));
+});
+
+// ---------- visual-inertial navigation (2026-10-10) ----------
+
+// Each VIO flight is flown once and shared. Records the worst and mean position error, the
+// error of the drone's position relative to the gate it is heading for (what steering
+// depends on), and the furthest the IMU-only dead reckoning strays.
+const vioFlights = new Map();
+function vioFlight(seed, difficulty, wind = 'off') {
+  const key = `${seed}/${difficulty}/${wind}`;
+  if (!vioFlights.has(key)) {
+    const r = { maxErr: 0, sumErr: 0, maxRel: 0, sumRel: 0, k: 0, maxDr: 0, outside: 0, kRel: 0, launchBias: null };
+    r.sim = run(seed, 50, {
+      difficulty, nav: 'vio', wind,
+      onStep(sim) {
+        const E = sim.est;
+        if (!r.launchBias && sim.t >= sim.launchAt) r.launchBias = [0, 1, 2].map((k) => Math.abs(E.x[6 + k] - E.bias[k]));
+        if (sim.t < sim.launchAt) return;
+        const n = navError(sim), x = E.x, g = sim.state.target;
+        r.maxErr = Math.max(r.maxErr, n.err);
+        r.sumErr += n.err;
+        r.maxDr = Math.max(r.maxDr, n.dr);
+        if (n.err > 3 * n.sigma) r.outside++;
+        r.k++;
+        // on the run in to a gate (inside 15 m), where it has had a good look at it
+        if (v3.len(v3.sub(sim.course.gates[g].pos, sim.drone.pos)) > 15) return;
+        const rel = v3.len(v3.sub(v3.sub(sim.belief.gates[g].pos, [x[0], x[1], x[2]]), v3.sub(sim.course.gates[g].pos, sim.drone.pos)));
+        r.maxRel = Math.max(r.maxRel, rel);
+        r.sumRel += rel;
+        r.kRel++;
+      },
+    });
+    vioFlights.set(key, r);
+  }
+  return vioFlights.get(key);
+}
+
+test('vio: a new nav mode with its own filter; the other modes carry none', () => {
+  assert.ok(NAV_MODES.includes('vio'));
+  const sim = makeSim({ seed: 3, nav: 'vio' });
+  assert.equal(sim.est.n, 9 + 3 * sim.course.gates.length);
+  assert.equal(sim.launchAt, VIO.lookFirst);
+  assert.ok(sim.vision, 'it uses the camera');
+  assert.ok(sim.est.bias.every((b) => Math.abs(b) <= IMU.bias));
+  for (const nav of ['truth', 'vision', 'blind']) {
+    assert.equal(makeSim({ seed: 3, nav }).est, null);
+    assert.equal(navError(makeSim({ seed: 3, nav })), null);
+  }
+  // the body axes are a right-handed orthonormal frame, y along the thrust
+  sim.drone.thrust = [7, G, -3];
+  const { bx, by, bz } = bodyAxes(sim.drone);
+  for (const [a, b] of [[bx, by], [bx, bz], [by, bz]]) assert.ok(Math.abs(v3.dot(a, b)) < 1e-12);
+  assert.ok(v3.len(v3.sub(by, v3.norm(sim.drone.thrust))) < 1e-12);
+  const c = [bx[1] * by[2] - bx[2] * by[1], bx[2] * by[0] - bx[0] * by[2], bx[0] * by[1] - bx[1] * by[0]];
+  assert.ok(v3.len(v3.sub(c, bz)) < 1e-12);
+});
+
+test('vio: on the pad, zero-velocity updates find the accelerometer bias before launch', () => {
+  // the bias starts up to 0.3 m/s^2 per axis, unknown; a second on the pad pins it down to
+  // what the accelerometer noise allows in that time (about 0.03)
+  const before = [], after = [];
+  for (const seed of SEEDS) {
+    const { launchBias, sim } = vioFlight(seed, 'normal');
+    assert.ok(Math.max(...launchBias) < 0.1, `seed ${seed}: bias still ${launchBias.map((b) => b.toFixed(3))} m/s^2 out at launch`);
+    before.push(...sim.est.bias.map(Math.abs));
+    after.push(...launchBias);
+  }
+  assert.ok(mean(after) < mean(before) / 5, `bias error only fell from ${mean(before).toFixed(3)} to ${mean(after).toFixed(3)}`);
+});
+
+for (const difficulty of DIFFICULTIES) {
+  test(`vio: IMU + camera fly ${difficulty} courses cleanly while the IMU alone drifts off`, () => {
+    for (const seed of SEEDS) {
+      const r = vioFlight(seed, difficulty), { sim } = r;
+      assert.equal(sim.state.misses, 0, `seed ${seed}: ${sim.state.misses} missed gates`);
+      assert.equal(sim.state.crashes, 0, `seed ${seed}: ${sim.state.crashes} crashes`);
+      assert.ok(sim.state.laps.length >= 2, `seed ${seed}: only ${sim.state.laps.length} laps`);
+      // where it thinks it is, against where it is
+      assert.ok(r.maxErr < 1.2, `seed ${seed}: position estimate ${r.maxErr.toFixed(2)} m out at worst`);
+      assert.ok(r.sumErr / r.k < 0.45, `seed ${seed}: position estimate ${(r.sumErr / r.k).toFixed(2)} m out on average`);
+      // relative to the gate it is about to fly through, which is what steering needs, it
+      // is far better: the drone and the gate are wrong together
+      assert.ok(r.sumRel / r.kRel < 0.12, `seed ${seed}: ${(r.sumRel / r.kRel).toFixed(3)} m out relative to the next gate on average`);
+      assert.ok(r.maxRel < 0.75, `seed ${seed}: ${r.maxRel.toFixed(2)} m out relative to the next gate at worst`);
+      // the filter knows how sure it is: rarely outside three sigma
+      assert.ok(r.outside / r.k < 0.02, `seed ${seed}: outside 3 sigma ${((r.outside / r.k) * 100).toFixed(1)}% of the time`);
+      // the same readings, dead reckoned from each lap's start, stray by metres
+      assert.ok(r.maxDr > 2, `seed ${seed}: dead reckoning only strayed ${r.maxDr.toFixed(1)} m`);
+      assert.ok(sim.est.stats.updates > 500 && sim.vision.stats.replans > 0);
+      // and the bias stays found in flight
+      for (let k = 0; k < 3; k++) assert.ok(Math.abs(sim.est.x[6 + k] - sim.est.bias[k]) < 0.1, `seed ${seed}: bias axis ${k} out`);
+    }
+  });
+}
+
+test('vio: clean in gusty wind too, with the wind observer running on the accelerometer', () => {
+  for (const seed of SEEDS) {
+    const r = vioFlight(seed, 'normal', 'gusty');
+    assert.equal(r.sim.state.misses + r.sim.state.crashes, 0, `seed ${seed}: ${r.sim.state.misses} misses, ${r.sim.state.crashes} crashes`);
+    assert.ok(r.maxErr < 1.2, `seed ${seed}: ${r.maxErr.toFixed(2)} m out`);
+    assert.ok(r.sim.dist.every(Number.isFinite));
+  }
+});
+
+test('vio costs little lap time against ground truth', () => {
+  const ratios = SEEDS.map((seed) => {
+    const vio = mean(vioFlight(seed, 'normal').sim.state.laps.slice(1));
+    const truth = mean(run(seed, 50).state.laps.slice(1));
+    assert.ok(vio < truth * 1.06, `seed ${seed}: vio ${vio.toFixed(2)} s vs truth ${truth.toFixed(2)} s`);
+    return vio / truth;
+  });
+  assert.ok(mean(ratios) < 1.035, `vio laps average ${((mean(ratios) - 1) * 100).toFixed(1)}% slower`);
+});
+
+test('vio: after a crash the estimate restarts near the respawn point and the race carries on', () => {
+  const sim = makeSim({ seed: 1, nav: 'vio' });
+  for (let i = 0; i < 6 * 120; i++) step(sim, 1 / 120);
+  const passed = sim.state.gatesPassed;
+  assert.ok(passed >= 2 && sim.state.crashes === 0);
+  // shove the drone into the top bar of the gate it is heading for
+  const gate = sim.course.gates[sim.state.target];
+  sim.drone.pos = v3.add(v3.add(gate.pos, v3.scale(gate.up, GATE_INNER / 2 + FRAME.bar / 2)), v3.scale(gate.normal, -1.2));
+  sim.drone.vel = v3.scale(gate.normal, 15);
+  for (let i = 0; i < 120 && !sim.crash; i++) step(sim, 1 / 120);
+  assert.equal(sim.state.crashes, 1, 'never hit the bar');
+  for (let i = 0; i < 6 * 120 && sim.events.at(-1).type !== 'respawn'; i++) step(sim, 1 / 120);
+  assert.equal(sim.events.at(-1).type, 'respawn');
+  assert.ok(navError(sim).err < 1.2, `restarted ${navError(sim).err.toFixed(2)} m out`);
+  let worst = 0;
+  for (let i = 0; i < 30 * 120; i++) {
+    step(sim, 1 / 120);
+    if (sim.t > sim.respawnAt + 2) worst = Math.max(worst, navError(sim).err);
+  }
+  assert.equal(sim.state.crashes, 1, 'crashed again after the respawn');
+  assert.ok(sim.state.laps.length >= 1 && sim.state.gatesPassed > passed + 10);
+  assert.ok(worst < 1.2, `${worst.toFixed(2)} m out after the respawn`);
+});
+
+test('vio flights are deterministic', () => {
+  const a = run(5, 20, { nav: 'vio', difficulty: 'hard' }), b = run(5, 20, { nav: 'vio', difficulty: 'hard' });
+  assert.deepEqual(a.drone.pos, b.drone.pos);
+  assert.deepEqual([...a.est.x], [...b.est.x]);
+  assert.deepEqual(a.est.stats, b.est.stats);
 });
