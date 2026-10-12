@@ -6,8 +6,10 @@ import { makeTelemetry, resetTelemetry, sampleTelemetry, drawTelemetry } from '.
 import { ROSTER, rosterFor, makeField, syncField, standings, gapText, results, RACE } from './field.js';
 import { motorTone, makeWash, emitWash, stepWash, WASH } from './fx.js';
 import { makeAudio } from './audio.js';
+import { makeLanding } from './landing.js';
 
 const DT = 1 / 120;
+const initialHash = location.hash; // before the app writes its own (a plain visit gets the intro)
 const $ = (id) => document.getElementById(id);
 
 // ---------- renderer ----------
@@ -1049,7 +1051,15 @@ function readSticks(dt) {
   return st;
 }
 
+// intro overlay: a pitch, quick starts and what the latest overnight build added
+const landing = makeLanding({ onStart: (h) => { if (location.hash !== h) location.hash = h; } });
+
 addEventListener('keydown', (e) => {
+  if (landing.isOpen()) {
+    if (e.key === 'Escape') landing.close();
+    return; // no shortcuts or flying behind the intro
+  }
+  if (e.key === '?' || e.key === 'i') { landing.show(); return; }
   if (pilot === 'manual' && FLIGHT_KEYS.has(keyName(e))) {
     keys.add(keyName(e));
     e.preventDefault();
@@ -1270,3 +1280,4 @@ buildWorld();
 applyLook();
 chaseCam.position.set(sim.drone.pos[0], 6, sim.drone.pos[2] - 12);
 requestAnimationFrame(frame);
+landing.boot(initialHash);

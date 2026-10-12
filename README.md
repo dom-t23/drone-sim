@@ -23,15 +23,18 @@ This is an experiment in what Claude can build on its own. A scheduled Claude ru
 | **Sound** (or `M`) | Motor sound and race cues on or off |
 | **New course** (or `N`) | Generate a new gate layout |
 | **Share** | Copy a link to this exact course |
+| **What's new** (under the title, or `?`) | The intro: quick starts and what the latest overnight builds added |
 
 **Flying it yourself** (Pilot: you): `W`/`↑` speed, `A` `D`/`←` `→` turn, `Space`/`Shift` (or `E`/`Q`) climb and descend. On phones, on-screen sticks appear (left: speed and turn; right: climb and drift); gamepads work too. You race the racing-line autopilot, shown as a cyan ghost, and your own best lap on that course, shown as a gold ghost (kept in your browser).
+
+A plain visit opens with an intro card: four quick starts and the latest build's notes, read live from `CHANGELOG.md`. It shows once per build; shared links skip it.
 
 The course is in the URL, e.g. https://dom-t23.github.io/drone-sim/#seed=12&d=hard (add `&nav=vision` for vision mode, `&nav=vio` for vision + IMU, `&wind=gusty` for wind, `&pilot=manual` to race it yourself, `&field=1` for a multi-drone race, `&night=1` for night mode), so any layout can be shared or revisited.
 
 ## How it works
 
 - `src/sim.js` is the simulation core with no rendering dependencies: course generation (three difficulties; hard adds big climbs, angled gates and dive gates), quadrotor dynamics (thrust vector with tilt and thrust limits, first-order lag, drag), the racing-line planner, both autopilots, the assisted manual pilot, gate/lap detection, collisions with gate frames, legs and pillars (crash, tumble and respawn), vision mode (camera model, PnP, gating and fusion, in-flight re-planning) and visual-inertial navigation (a simulated accelerometer and an EKF that estimates the drone and the gates together).
-- `src/main.js` renders it with three.js and runs the sim at a fixed 120 Hz timestep; `src/telemetry.js` draws the telemetry panel, `src/splits.js` works out gate splits, `src/race.js` the gap to the rival when you race it, `src/field.js` the multi-drone roster, timing tower, chequered flag and results, `src/ghost.js` records the best lap and replays it, `src/fx.js` holds the rotor physics behind the prop wash and motor sound, and `src/audio.js` synthesises the sound with Web Audio.
+- `src/main.js` renders it with three.js and runs the sim at a fixed 120 Hz timestep; `src/telemetry.js` draws the telemetry panel, `src/splits.js` works out gate splits, `src/race.js` the gap to the rival when you race it, `src/field.js` the multi-drone roster, timing tower, chequered flag and results, `src/ghost.js` records the best lap and replays it, `src/fx.js` holds the rotor physics behind the prop wash and motor sound, and `src/audio.js` synthesises the sound with Web Audio, and `src/intro.js` (content) with `src/landing.js` (DOM) make the intro card and build badge from the changelog.
 - `test/` holds headless checks run with `npm test` (Node 18+). They fly a set of course seeds on every difficulty and nav mode and fail if the drone misses gates, crashes, strays from its line, gets slower, mis-estimates gates, or the state goes non-finite.
 
 The default autopilot flies a **racing line**: a smooth closed spline through every gate, crossing each one square-on. Where it crosses each opening (up to 0.6 m off centre) and how hard it swings in are tuned by coordinate descent on the planned lap time. Each point on it gets the fastest speed whose turn still fits the drone's tilt and thrust limits, then forward and backward passes add acceleration and braking, using only what the turn leaves of that envelope (a friction circle), so it brakes early for corners over a crest. The tracker feeds forward the acceleration the path needs (turning, speeding up, beating drag) and corrects any position and velocity error with PD feedback. The line on the course shows the plan, coloured blue (slow) to orange (fast).

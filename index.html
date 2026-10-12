@@ -107,6 +107,38 @@
     .res-foot { color: var(--muted); font-size: 12px; margin-top: 6px; }
     .res-btns { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
     .res-btns button { flex: 1; padding: 7px 10px; white-space: nowrap; }
+    .title { pointer-events: auto; }
+    .about { display: block; margin: 4px 0 0; padding: 0; border: 0; border-radius: 0; background: none; color: var(--accent);
+      font-size: 11px; font-weight: 600; letter-spacing: .02em; backdrop-filter: none; -webkit-backdrop-filter: none; }
+    .about:hover { text-decoration: underline; }
+    .intro { position: fixed; inset: 0; z-index: 10; display: grid; place-items: center; padding: 16px;
+      background: rgba(5, 9, 16, .55); }
+    .intro-card { position: relative; width: min(560px, 100%); max-height: calc(100vh - 32px); max-height: calc(100dvh - 32px); overflow-y: auto; padding: 20px 22px;
+      background: rgba(11, 18, 32, .94); border: 1px solid var(--line); border-radius: 14px; box-shadow: 0 12px 48px rgba(0,0,0,.5); }
+    .intro-x { position: absolute; top: 10px; right: 10px; width: 34px; height: 34px; padding: 0; font-size: 20px; line-height: 1;
+      color: var(--muted); backdrop-filter: none; -webkit-backdrop-filter: none; }
+    .intro-kicker { color: var(--accent); font-size: 11px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; }
+    .intro h1 { margin: 2px 0 6px; font-size: 30px; letter-spacing: .01em; }
+    .intro p { margin: 0 0 14px; color: #c3cedd; }
+    .intro-starts { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    .intro-start { text-align: left; border-radius: 10px; backdrop-filter: none; -webkit-backdrop-filter: none; padding: 10px 12px; display: flex; flex-direction: column; gap: 2px; }
+    .intro-start b { font-weight: 700; }
+    .intro-start span { color: var(--muted); font-size: 12px; }
+    .intro-new { margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--line); font-size: 13px; }
+    .intro-h { display: flex; justify-content: space-between; color: var(--muted); font-size: 11px; letter-spacing: .08em;
+      text-transform: uppercase; margin-bottom: 4px; }
+    .intro-h span { letter-spacing: 0; text-transform: none; }
+    .intro-latest { font-size: 16px; font-weight: 700; margin-bottom: 4px; }
+    .intro ul, .intro ol { margin: 0 0 12px; padding-left: 18px; color: #c3cedd; }
+    .intro li { margin: 2px 0; }
+    .intro ol { list-style: none; padding-left: 0; }
+    .intro ol time { display: inline-block; width: 52px; color: var(--muted); font-variant-numeric: tabular-nums; }
+    .intro code { font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; background: rgba(255,255,255,.08); padding: 0 4px; border-radius: 4px; }
+    .intro-foot { color: var(--muted); font-size: 12px; }
+    .intro a { color: var(--accent); }
+    .intro-btns { display: flex; justify-content: flex-end; margin-top: 14px; }
+    .intro-btns button { border-color: var(--accent); color: var(--accent); padding: 8px 18px; font-weight: 600; }
+    @media (max-width: 560px) { .intro-card { padding: 16px; } .intro h1 { font-size: 24px; } .intro p { font-size: 13px; } }
     @media (max-width: 560px) { .board { width: 190px; } .board .row { grid-template-columns: 12px 8px 1fr auto; }
       .board .row > em:last-child { display: none; } .board-head small { display: none; } }
     @media (max-width: 560px) { .countdown { font-size: 64px; } .pad { width: 110px; height: 110px; } }
@@ -120,7 +152,7 @@
   <canvas class="overlay" id="overlay"></canvas>
   <div class="hud">
     <div class="col">
-      <div class="panel title">Drone Sim<small>Self-flying racer · built overnight by Claude</small></div>
+      <div class="panel title">Drone Sim<small>Self-flying racer · built overnight by Claude</small><button class="about" id="b-about" title="About and what's new (?)">What's new</button></div>
       <div class="panel note" id="nav-note" hidden></div>
       <div class="panel board" id="board" hidden aria-label="Race standings"></div>
       <div class="panel tm" id="telemetry" hidden aria-label="Telemetry"></div>
@@ -169,6 +201,24 @@
     <button id="b-sound" title="Motor sound (M)">Sound</button>
     <button id="b-course">New course</button>
     <button id="b-share">Share</button>
+  </div>
+  <div class="intro" id="intro" hidden role="dialog" aria-modal="true" aria-labelledby="intro-title">
+    <div class="intro-card">
+      <button class="intro-x" id="intro-x" aria-label="Close">×</button>
+      <div class="intro-kicker">Built overnight by Claude</div>
+      <h1 id="intro-title">Drone Sim</h1>
+      <p>A racing drone that flies itself. It plans its own racing line, finds the gates with a camera, works out where it is with a Kalman filter and races a field of rivals. Every feature here was written, tested and shipped by Claude on scheduled overnight runs, with nobody at the keyboard.</p>
+      <div class="intro-starts" id="intro-starts"></div>
+      <section class="intro-new" id="intro-new" hidden>
+        <div class="intro-h">Latest build <span id="intro-date"></span></div>
+        <div class="intro-latest" id="intro-latest"></div>
+        <ul id="intro-hl"></ul>
+        <div class="intro-h">Before that</div>
+        <ol id="intro-recent"></ol>
+        <div class="intro-foot"><span id="intro-count"></span> <a href="https://github.com/dom-t23/drone-sim/blob/main/CHANGELOG.md" target="_blank" rel="noopener">Full changelog</a> · <a href="https://github.com/dom-t23/drone-sim" target="_blank" rel="noopener">Source</a></div>
+      </section>
+      <div class="intro-btns"><button id="intro-go">Just watch</button></div>
+    </div>
   </div>
   <div class="err" id="err">This demo needs WebGL. Try a recent version of Chrome, Firefox or Safari.</div>
   <script type="module" src="src/main.js"></script>
