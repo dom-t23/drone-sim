@@ -415,13 +415,18 @@ export function racingPilot(sim) {
   const ahead = Math.round((speed * DRONE.thrustLag) / plan.ds);
   const q = plan.pts[track.idx];
   const qa = plan.pts[(track.idx + ahead) % N];
-  const cap = 3 + P.launchRate * (sim.t - Math.max(sim.launchAt, sim.respawnAt ?? -Infinity)); // gentle launch from a standstill
+  // camera dark and the next gate not yet pinned down: don't fly at it blind
+  const vBlind = blindCap(sim, drone);
+  // gentle launch from a standstill (the start, a respawn, or a blind stop)
+  const cap = 3 + P.launchRate * (sim.t - Math.max(sim.launchAt, sim.respawnAt ?? -Infinity, sim.vision?.resumeAt ?? -Infinity));
   // in a race, step aside for (or hold back behind) other drones
   const tr = sim.traffic ? dodge(sim, drone, qa, speed) : null;
   // (hold-back braking is limited to TRAFFIC.brake, so it never starves the steering)
   // (not before the start gate: off the grid, everyone goes for it)
   const vHold = tr && sim.state.gatesPassed > 0 ? Math.max(tr.vCap, v3.dot(drone.vel, qa.t) - TRAFFIC.brake / P.kd) : Infinity;
-  const vRef = Math.max(0, Math.min(qa.v, cap, vHold));
+  // (braking for a blind stop is limited to twice its plan, for the same reason)
+  const vStop = vBlind < Infinity ? Math.max(vBlind, v3.dot(drone.vel, qa.t) - 2 * BLACKOUT.brake / P.kd) : Infinity;
+  const vRef = Math.max(0, Math.min(qa.v, cap, vHold, vStop));
   const atRef = vRef < qa.v ? (vRef < cap ? 0 : Math.min(P.aAccel, P.launchRate)) : qa.at;
   const velRef = v3.scale(qa.t, vRef);
   let a = v3.add(v3.scale(qa.kv, vRef * vRef), v3.scale(qa.t, atRef));
@@ -1490,6 +1495,10 @@ export function makeSim({ seed = 1, gates, pilot = 'racing', difficulty = 'norma
       frame: null, // latest detections, for the onboard overlay
       planned: belief.gates.map((b) => b.pos.slice()),
       lastPlan: 0,
+      darkUntil: -Infinity, // camera blackout (cameraBlackout) until this time
+      held: null, // the doubtful gate it is stopping (or stopped) short of...
+      heldAt: 0, // ...and the gate count it will have reached once through it
+      resumeAt: -Infinity, // when it last set off again after a blind stop
       stats: { frames: 0, accepted: 0, rejected: 0, lost: 0, wild: 0, wildRejected: 0, replans: 0 },
     } : null,
     plan,
@@ -1572,6 +1581,14 @@ export function step(sim, dt) {
   }
   const hs = Math.hypot(drone.vel[0], drone.vel[2]);
   if (hs > 0.5 && sim.pilot !== 'manual') drone.yaw = Math.atan2(drone.vel[0], drone.vel[2]);
+  const V = sim.vision;
+  if (V && V.held !== null && hs < 3 && sim.pilot !== 'manual') {
+    // stopped short of a gate it can't see: turn to look where it thinks the gate is
+    const b = sim.belief.gates[V.held].pos, me = navState(sim).pos;
+    const err = Math.atan2(b[0] - me[0], b[2] - me[2]) - drone.yaw;
+    const wrap = Math.atan2(Math.sin(err), Math.cos(err)), turn = BLACKOUT.turnRate * dt;
+    drone.yaw += Math.max(-turn, Math.min(turn, wrap));
+  }
 
   // gate crossing check (segment prev -> pos against the target gate's plane)
   const gate = course.gates[state.target];
@@ -1609,8 +1626,105 @@ export function step(sim, dt) {
   sim.t += dt;
   if (sim.vision && (sim.vision.clock += dt) >= 1 / CAMERA.rate - 1e-9) {
     sim.vision.clock -= 1 / CAMERA.rate;
-    visionFrame(sim);
+    if (sim.t < sim.vision.darkUntil) sim.vision.frame = { t: sim.t, dets: [], dark: true };
+    else visionFrame(sim);
   }
+}
+
+// Camera blackout: cut the onboard camera for a few seconds (as if the lens fogged or the
+// video link dropped). Vision mode flies on the gate estimates it already has; vision + IMU
+// flies on the accelerometer alone, so its estimate drifts and its uncertainty grows until
+// the first gate it sees again snaps it back. Returns false when there is no camera.
+//
+// The racing pilot knows what it doesn't know. While the camera is dark it keeps racing
+// through gates it has already pinned down, but if the next gate is one it is still unsure
+// of (seen too little, so it could be metres from where the map says), it brakes to a stop
+// BLACKOUT.stop short of where it thinks the gate is and hovers there until it can see.
+export const BLACKOUT = {
+  secs: 4, // how long the button cuts the camera
+  trust: 0.2, // m: the next gate's 1-sigma doubt (relative to the drone) it will race through blind
+  stop: 8, // m: how far short of a doubtful gate it stops (gates can be 2.6 m off the map)
+  brake: 6, // m/s^2: the braking it plans that stop with
+  patience: 3, // s: once it can see again, it waits at most this long to find the gate
+  turnRate: 2, // rad/s: while stopped, it turns to look at where it thinks the gate is
+};
+export function cameraBlackout(sim, secs = BLACKOUT.secs) {
+  if (!sim.vision) return false;
+  sim.vision.darkUntil = sim.t + secs;
+  // fly the dark on a line through the best estimates it has
+  if (sim.pilot === 'racing') replan(sim);
+  sim.events.push({ t: sim.t, type: 'blackout', until: sim.t + secs });
+  return true;
+}
+export function cameraDark(sim) {
+  return !!sim.vision && sim.t < sim.vision.darkUntil;
+}
+
+// How sure the drone is of where gate id is relative to itself: 1-sigma (root of the
+// covariance trace) of gate minus drone. With vision + IMU the two errors are correlated
+// (EKF-SLAM), so the joint covariance is used: P_gg + P_pp - P_gp - P_pg.
+export function gateDoubt(sim, id) {
+  if (!sim.belief) return 0;
+  if (!sim.est) {
+    const c = sim.belief.gates[id].cov;
+    return Math.sqrt(c[0] + c[4] + c[8]);
+  }
+  const { P, n } = sim.est, j = 9 + 3 * id;
+  let tr = 0;
+  for (let k = 0; k < 3; k++) tr += P[(j + k) * n + j + k] + P[k * n + k] - 2 * P[(j + k) * n + k];
+  return Math.sqrt(Math.max(0, tr));
+}
+
+// The racing pilot's speed limit for a doubtful gate (Infinity when it trusts the next
+// gate): whatever still lets it stop BLACKOUT.stop short of it. It applies while the
+// camera is dark and stays on after, until the camera has pinned that gate down; then the
+// line is re-planned through where the gate really is and the drone sets off again.
+export function blindCap(sim, me = navState(sim)) {
+  const V = sim.vision;
+  if (!V) return Infinity;
+  const dark = cameraDark(sim), st = sim.state, nG = sim.course.gates.length, P = sim.plan;
+  if (V.held !== null && st.gatesPassed > V.heldAt) V.held = null; // flew through it after all
+  // released once the camera has pinned the gate down, or (if it can't find it from where
+  // it stopped) after a while anyway: then it flies on as it would on a first lap
+  if (V.held !== null && !dark && (gateDoubt(sim, V.held) <= BLACKOUT.trust || sim.t - V.darkUntil > BLACKOUT.patience)) {
+    sim.events.push({ t: sim.t, type: 'resume', gate: V.held });
+    V.held = null;
+    V.resumeAt = sim.t;
+    replan(sim);
+  }
+  const speed = v3.len(me.vel), s = P.pts[sim.track.idx].s;
+  // how far to gate j: to its plane for the next gate, along the line for the ones after
+  const dist = (j, k) => {
+    if (k === 0) {
+      const b = sim.belief.gates[j];
+      return -v3.dot(v3.sub(me.pos, b.pos), b.normal);
+    }
+    return ((P.gateS[j] - s) % P.length + P.length) % P.length;
+  };
+  let id = V.held, ahead = V.held === null ? 0 : V.heldAt - st.gatesPassed;
+  if (id === null) {
+    if (!dark) return Infinity;
+    // the first gate it isn't sure of and can still stop for, within stopping reach. It
+    // looks past the next gate too, so a doubtful gate just after a known one doesn't catch
+    // it at full speed. A gate too close to stop well short of, even braking half as hard
+    // again as planned, it commits to and flies through on what it has.
+    const reach = speed * speed / (2 * BLACKOUT.brake) + BLACKOUT.stop + 5;
+    for (let k = 0; k < nG; k++) {
+      const j = (st.target + k) % nG, dj = dist(j, k);
+      if (dj > reach) break;
+      if (gateDoubt(sim, j) > BLACKOUT.trust && speed * speed / (3 * BLACKOUT.brake) <= dj - BLACKOUT.stop / 2) { id = j; ahead = k; break; }
+    }
+    if (id === null) return Infinity;
+  }
+  const d = dist(id, ahead);
+  const v = Math.sqrt(2 * BLACKOUT.brake * Math.max(0, d - BLACKOUT.stop));
+  if (V.held === null && v < speed + 1) {
+    // from here on it has to brake for it: commit to stopping until it can see the gate
+    V.held = id;
+    V.heldAt = st.gatesPassed + ahead;
+    sim.events.push({ t: sim.t, type: 'hold', gate: id });
+  }
+  return v;
 }
 
 // Roll/pitch for rendering: tilt the body so its up axis matches the thrust vector.

@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { makeSim, step, GATE_INNER, v3, DIFFICULTIES, NAV_MODES, WIND_MODES, PILOTS, DRONE, navError, shareTraffic, bumpAll } from './sim.js';
+import { makeSim, step, GATE_INNER, v3, DIFFICULTIES, NAV_MODES, WIND_MODES, PILOTS, DRONE, navError, shareTraffic, bumpAll, cameraBlackout, cameraDark } from './sim.js';
 import { makeRace, syncRace, raceGap } from './race.js';
 import { makeGhostRecorder, recordGhost, ghostPose, encodeGhost, decodeGhost } from './ghost.js';
 import { makeTelemetry, resetTelemetry, sampleTelemetry, drawTelemetry } from './telemetry.js';
@@ -301,6 +301,7 @@ function buildWorld() {
 
   trailCount = 0;
   lastEvents = 0;
+  darkWatch = null;
   updateHud(true);
 }
 
@@ -750,6 +751,25 @@ function updateStreaks(dtSim) {
 
 // ---------- HUD ----------
 let lastEvents = 0;
+// camera blackout: the drone whose camera was cut, and how far through its events we are
+let darkWatch = null;
+let darkBtnShown = false;
+function updateBlackout() {
+  const vs = viewSim(), btn = $('b-dark');
+  if (darkBtnShown !== !!vs.vision) {
+    darkBtnShown = !!vs.vision;
+    btn.hidden = !darkBtnShown;
+  }
+  btn.classList.toggle('on', cameraDark(vs));
+  if (!darkWatch) return;
+  const ds = darkWatch.sim;
+  for (; darkWatch.i < ds.events.length; darkWatch.i++) {
+    const e = ds.events[darkWatch.i];
+    if (e.type === 'blackout') toast('Camera dark', true);
+    if (e.type === 'hold') toast(`Can't see gate ${e.gate + 1}: stopping short`, true);
+    if (e.type === 'resume') toast(`Found gate ${e.gate + 1}: go!`);
+  }
+}
 function fmt(t) { return t == null ? '–' : `${t.toFixed(2)} s`; }
 function updateHud(force) {
   const s = sim.state;
@@ -801,6 +821,7 @@ function updateHud(force) {
     $('s-wind').textContent = `${Math.hypot(w[0], w[2]).toFixed(0)} m/s · est ${Math.hypot(est[0], est[2]).toFixed(0)}`;
   }
   if (force) return;
+  updateBlackout();
   for (; lastEvents < sim.events.length; lastEvents++) {
     const e = sim.events[lastEvents];
     if (e.type === 'lap') toast(pilot === 'manual' ? lapToast(e.time) : `Lap ${fmt(e.time)}`);
@@ -864,8 +885,8 @@ function toast(msg, bad = false) {
 
 // A short note on what the nav mode shows, faded out after a while.
 const NAV_NOTES = {
-  vision: '<b>Vision.</b> The drone\'s map has every gate up to 2.6 m out. Its camera finds the real gates (corner boxes in the onboard view) and it re-plans through its estimates (cyan).',
-  vio: '<b>Vision + IMU.</b> Now the drone doesn\'t know where <i>it</i> is either: just a noisy, biased accelerometer and the camera. A Kalman filter estimates its position (magenta ball, 2σ) and every gate together. The red ball is the IMU alone: it drifts metres off every lap.',
+  vision: '<b>Vision.</b> The drone\'s map has every gate up to 2.6 m out. Its camera finds the real gates (corner boxes in the onboard view) and it re-plans through its estimates (cyan). Press <b>Blackout</b> (B) to cut its camera.',
+  vio: '<b>Vision + IMU.</b> Now the drone doesn\'t know where <i>it</i> is either: just a noisy, biased accelerometer and the camera. A Kalman filter estimates its position (magenta ball, 2σ) and every gate together. The red ball is the IMU alone: it drifts metres off every lap. Press <b>Blackout</b> (B) to cut its camera and watch the ball grow.',
   blind: '<b>Map only.</b> The drone trusts a map with every gate up to 2.6 m out (cyan), so it misses gates. As a ghost run, it flies straight through any frame it meets.',
 };
 const coarse = matchMedia('(pointer: coarse)').matches;
@@ -909,6 +930,12 @@ $('b-nav').onclick = () => {
   nav = NAV_MODES[(NAV_MODES.indexOf(nav) + 1) % NAV_MODES.length];
   syncButtons();
   buildWorld();
+};
+$('b-dark').onclick = () => {
+  const vs = viewSim();
+  if (!cameraBlackout(vs)) { toast('No camera to cut: try Nav: vision'); return; }
+  darkWatch = { sim: vs, i: vs.events.length - 1 };
+  updateBlackout();
 };
 $('b-tm').onclick = () => {
   const el = $('telemetry');
@@ -1070,6 +1097,7 @@ addEventListener('keydown', (e) => {
   if (e.key === 'p') $('b-pilot').click();
   if (e.key === 'd') $('b-diff').click();
   if (e.key === 'v') $('b-nav').click();
+  if (e.key === 'b' && !$('b-dark').hidden) $('b-dark').click();
   if (e.key === 'w') $('b-wind').click();
   if (e.key === 't') $('b-tm').click();
   if (e.key === 'g') $('b-ghost').click();
@@ -1112,6 +1140,25 @@ function drawOverlay(rect, label) {
   octx.lineWidth = 1.5;
   let found = 0;
   const fresh = vs.t - frame.t < 0.2;
+  if (fresh && frame.dark) {
+    // camera blackout: no picture, just static
+    octx.fillStyle = 'rgba(8, 10, 14, .82)';
+    octx.fillRect(rect.x, rect.top, rect.w, rect.h);
+    for (let i = 0; i < 26; i++) {
+      octx.fillStyle = `rgba(200, 210, 225, ${(0.05 + Math.random() * 0.12).toFixed(2)})`;
+      octx.fillRect(rect.x, rect.top + Math.random() * rect.h, rect.w, 1 + Math.random() * 2);
+    }
+    const left = Math.max(0, vs.vision.darkUntil - vs.t);
+    octx.fillStyle = '#ff7a7a';
+    octx.font = `700 ${Math.round(Math.min(28, rect.w / 9))}px ui-sans-serif, system-ui, sans-serif`;
+    octx.textAlign = 'center';
+    const cy = rect.top + rect.h * 0.34; // above the toasts, which sit mid-screen
+    octx.fillText('NO SIGNAL', rect.x + rect.w / 2, cy);
+    octx.font = '600 11px ui-sans-serif, system-ui, sans-serif';
+    octx.fillStyle = '#c8d2e1';
+    octx.fillText(`camera back in ${left.toFixed(1)} s`, rect.x + rect.w / 2, cy + 18);
+    octx.textAlign = 'start';
+  }
   for (const det of fresh ? frame.dets : []) {
     const pts = det.world.map((p) => toScreen(p, rect));
     if (pts.some((q) => !q)) continue;
@@ -1131,8 +1178,8 @@ function drawOverlay(rect, label) {
     octx.font = '600 11px ui-sans-serif, system-ui, sans-serif';
     octx.fillStyle = 'rgba(11, 18, 32, .6)';
     octx.fillRect(label.x, label.y, 112, 18);
-    octx.fillStyle = found ? '#3ddc97' : '#8fa0b8';
-    octx.fillText(`VISION · ${found} gate${found === 1 ? '' : 's'}`, label.x + 6, label.y + 13);
+    octx.fillStyle = frame.dark ? '#ff7a7a' : found ? '#3ddc97' : '#8fa0b8';
+    octx.fillText(frame.dark ? 'VISION · dark' : `VISION · ${found} gate${found === 1 ? '' : 's'}`, label.x + 6, label.y + 13);
   }
 }
 

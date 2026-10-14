@@ -6,6 +6,7 @@ import {
   cameraPose, project, gateCorners, solveGatePose, CAMERA, optimiseLine, SHAPING, WIND,
   MANUAL, headingAxes, CRASH, FRAME, collide, makeScenery, gridOffset, GRID,
   NAV_MODES, IMU, VIO, navError, bodyAxes, bump, bumpAll, shareTraffic, CONTACT, TRAFFIC,
+  BLACKOUT, cameraBlackout, cameraDark, gateDoubt, blindCap,
 } from '../src/sim.js';
 import { ROSTER, rosterFor, makeField, syncField, standings, gapText, results, RACE } from '../src/field.js';
 import { makeRace, syncRace, raceGap } from '../src/race.js';
@@ -1131,6 +1132,146 @@ test('vio flights are deterministic', () => {
   assert.deepEqual(a.drone.pos, b.drone.pos);
   assert.deepEqual([...a.est.x], [...b.est.x]);
   assert.deepEqual(a.est.stats, b.est.stats);
+});
+
+// ---------- camera blackout ----------
+
+// Fly with the camera cut for BLACKOUT.secs from the moment the drone has passed `at`
+// gates (counting the start gate; a negative `at` counts from the start of the second lap).
+// Records the slowest it went in the dark, how close it got to the gate it was holding for,
+// and the filter's uncertainty around the blackout.
+function blackoutFlight(seed, difficulty, nav, at, { seconds = 34, wind = 'off' } = {}) {
+  const r = { t0: null, at, minSpeed: Infinity, holdGap: Infinity, sigma0: 0, sigmaDark: 0, sigmaAfter: Infinity, errAfter: Infinity };
+  r.sim = run(seed, seconds, {
+    difficulty, nav, wind,
+    onStep(sim) {
+      if (at < 0) r.at = at = sim.course.gates.length + 1 - at;
+      if (r.t0 === null && sim.state.gatesPassed >= at) {
+        r.t0 = sim.t;
+        r.sigma0 = sim.est ? navError(sim).sigma : 0;
+        assert.ok(cameraBlackout(sim));
+      }
+      if (r.t0 === null) return;
+      const dt = sim.t - r.t0;
+      if (sim.vision.held !== null) {
+        const g = sim.course.gates[sim.vision.held];
+        r.holdGap = Math.min(r.holdGap, -v3.dot(v3.sub(sim.drone.pos, g.pos), g.normal));
+      }
+      if (dt < BLACKOUT.secs) {
+        r.minSpeed = Math.min(r.minSpeed, v3.len(sim.drone.vel));
+        if (sim.est) r.sigmaDark = Math.max(r.sigmaDark, navError(sim).sigma);
+      } else if (sim.est && dt > BLACKOUT.secs + 3 && dt < BLACKOUT.secs + 6 && !sim.crash) {
+        r.sigmaAfter = Math.min(r.sigmaAfter, navError(sim).sigma);
+        r.errAfter = Math.min(r.errAfter, navError(sim).err);
+      }
+    },
+  });
+  r.events = r.sim.events.filter((e) => e.t >= r.t0);
+  return r;
+}
+
+test('blackout: cuts the camera for a few seconds; no camera, nothing to cut', () => {
+  for (const nav of ['truth', 'blind']) assert.equal(cameraBlackout(makeSim({ seed: 1, nav })), false);
+  const sim = makeSim({ seed: 2, nav: 'vision' });
+  for (let i = 0; i < 4 * 120; i++) step(sim, 1 / 120);
+  const frames = sim.vision.stats.frames, before = sim.belief.gates.map((b) => b.pos.slice());
+  assert.ok(cameraBlackout(sim, 2));
+  assert.ok(cameraDark(sim));
+  const t0 = sim.t;
+  for (let i = 0; i < 2 * 120 - 2; i++) {
+    step(sim, 1 / 120);
+    const f = sim.vision.frame;
+    assert.ok(f.t <= t0 || (f.dark && f.dets.length === 0), 'saw something in the dark');
+  }
+  assert.ok(sim.vision.frame.dark);
+  assert.equal(sim.vision.stats.frames, frames, 'the detector ran in the dark');
+  assert.deepEqual(sim.belief.gates.map((b) => b.pos), before, 'gate estimates moved with no camera');
+  for (let i = 0; i < 30; i++) step(sim, 1 / 120);
+  assert.ok(!cameraDark(sim) && !sim.vision.frame.dark && sim.vision.stats.frames > frames);
+  assert.equal(sim.events.filter((e) => e.type === 'blackout').length, 1);
+});
+
+test('blackout: gate doubt is large for gates the camera has not pinned down, small once it has', () => {
+  for (const nav of ['vision', 'vio']) {
+    const sim = run(3, 30, { nav });
+    assert.ok(gateDoubt(sim, sim.state.target) < BLACKOUT.trust, `${nav}: a mapped gate is still in doubt`);
+    const fresh = makeSim({ seed: 3, nav });
+    assert.ok(gateDoubt(fresh, 5) > 3, `${nav}: an unseen gate is trusted`);
+    assert.equal(blindCap(sim), Infinity, `${nav}: capped with the camera on`);
+  }
+  assert.equal(gateDoubt(makeSim({ seed: 3 }), 0), 0);
+});
+
+// first-lap blackouts: the drone is still finding the gates
+const FIRST_LAP = [1, 4, 7];
+for (const nav of ['vision', 'vio']) {
+  test(`blackout (${nav}): on the first lap it stops short of gates it hasn't pinned down, then finds them and races on`, () => {
+    let holds = 0, stops = 0, resumes = 0;
+    for (const difficulty of DIFFICULTIES) {
+      for (const seed of [1, 2, 7, 42]) {
+        for (const at of FIRST_LAP) {
+          const r = blackoutFlight(seed, difficulty, nav, at), s = r.sim.state, tag = `${difficulty} seed ${seed} at ${at}`;
+          assert.equal(s.misses, 0, `${tag}: missed a gate`);
+          assert.equal(s.crashes, 0, `${tag}: crashed`);
+          assert.ok(s.laps.length >= 1, `${tag}: no lap`);
+          if (r.events.some((e) => e.type === 'hold')) {
+            holds++;
+            if (r.minSpeed < 0.5) stops++;
+            // while holding it never got near the gate (the true one, which can be a metre
+            // nearer than it thinks)
+            assert.ok(r.holdGap > 4, `${tag}: held ${r.holdGap.toFixed(1)} m from the gate`);
+          }
+          if (r.events.some((e) => e.type === 'resume')) resumes++;
+        }
+      }
+    }
+    assert.ok(holds >= 30 && stops >= 20 && resumes >= 20, `${holds} holds, ${stops} full stops, ${resumes} resumes out of 36`);
+  });
+}
+
+test('blackout: without the caution, the same first-lap blackouts crash', () => {
+  const trust = BLACKOUT.trust;
+  BLACKOUT.trust = Infinity;
+  let crashes = 0;
+  try {
+    for (const nav of ['vision', 'vio']) {
+      for (const seed of [1, 2, 7, 42]) {
+        for (const at of FIRST_LAP) crashes += blackoutFlight(seed, 'normal', nav, at, { seconds: 24 }).sim.state.crashes;
+      }
+    }
+  } finally {
+    BLACKOUT.trust = trust;
+  }
+  assert.ok(crashes >= 3, `only ${crashes} crashes flying blind`);
+});
+
+test('blackout (vision): on a mapped lap it races straight through the dark', () => {
+  for (const seed of [1, 2, 7, 42]) {
+    const r = blackoutFlight(seed, 'normal', 'vision', -3, { seconds: 38 }), s = r.sim.state;
+    assert.equal(s.misses + s.crashes, 0);
+    assert.ok(!r.events.some((e) => e.type === 'hold'), `seed ${seed}: stopped on a mapped lap`);
+    assert.ok(s.laps[1] < s.laps[0], `seed ${seed}: the dark lap cost time (${s.laps[1].toFixed(2)} vs ${s.laps[0].toFixed(2)} s)`);
+  }
+});
+
+test('blackout (vio): flying on the IMU alone its uncertainty grows; the camera snaps it back', () => {
+  for (const difficulty of ['normal', 'hard']) {
+    for (const seed of [1, 2, 7, 42]) {
+      const r = blackoutFlight(seed, difficulty, 'vio', -3, { seconds: 40 }), s = r.sim.state, tag = `${difficulty} seed ${seed}`;
+      assert.equal(s.misses + s.crashes, 0, `${tag}: missed or crashed`);
+      assert.ok(r.sigmaDark > 2 * r.sigma0, `${tag}: sigma ${r.sigma0.toFixed(2)} -> ${r.sigmaDark.toFixed(2)} m in the dark`);
+      assert.ok(r.sigmaAfter < r.sigmaDark / 2, `${tag}: sigma still ${r.sigmaAfter.toFixed(2)} m after`);
+      assert.ok(r.errAfter < 0.4, `${tag}: still ${r.errAfter.toFixed(2)} m out after`);
+      assert.ok(s.gatesPassed >= r.at + 4, `${tag}: stuck after the blackout`);
+    }
+  }
+});
+
+test('blackout flights are deterministic', () => {
+  const a = blackoutFlight(42, 'hard', 'vio', 4, { seconds: 15 }).sim, b = blackoutFlight(42, 'hard', 'vio', 4, { seconds: 15 }).sim;
+  assert.deepEqual(a.drone.pos, b.drone.pos);
+  assert.deepEqual([...a.est.x], [...b.est.x]);
+  assert.deepEqual(a.events, b.events);
 });
 
 // ---------- drone-to-drone contact, racecraft and race results ----------

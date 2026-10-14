@@ -16,6 +16,7 @@ This is an experiment in what Claude can build on its own. A scheduled Claude ru
 | **Field** (or `F`) | Solo → a three-lap race for a field of five or six drones with different autopilots, a live timing tower and a results card |
 | **Course** (or `D`) | Difficulty: easy → normal → hard |
 | **Nav** (or `V`) | Ground truth → vision → vision + IMU → map only |
+| **Blackout** (or `B`) | With a camera (vision or vision + IMU): cut it for 4 seconds |
 | **Wind** (or `W`) | Off → breezy → gusty |
 | **Telemetry** (or `T`) | Live charts and gate splits |
 | **Ghost** (or `G`) | Show or hide the gold ghost of the best lap |
@@ -42,6 +43,8 @@ The default autopilot flies a **racing line**: a smooth closed spline through ev
 **Vision mode** (the **Nav** button) takes away the drone's perfect knowledge. Its map has every gate moved up to 2.6 m, so flying the map alone (**map only**) misses gates. With **vision**, a synthetic onboard camera finds the corners of the real gates in view, with pixel noise, lost corners and the odd wild one. Each detection is turned into a gate position by PnP (fitting the gate's known shape to the corners by Levenberg-Marquardt). It's checked against what the drone already believes (innovation gating, which throws out the wild ones) and fused into a running estimate. The racing line is re-planned through the corrected gates as it flies. The cyan frames show where the drone believes each gate is, and the onboard view shows the detections: green when used, red when rejected.
 
 **Vision + IMU** goes one step further: the drone doesn't know where *it* is either. All it has is the camera and an accelerometer with noise and an unknown bias, so integrating the accelerometer alone drifts metres off within a lap. An extended Kalman filter holds the drone's position, velocity and accelerometer bias together with every gate's position in one state (EKF-SLAM), so each gate the camera sees corrects the drone and the map at once. It finds the bias in a second on the start pad (zero-velocity updates), then races within about 0.2 m of where it really is, and within a few centimetres relative to the gate it's about to fly through. In the chase view, the magenta wire ball is where the drone thinks it is (two sigma in radius) and the red ball is where the accelerometer alone would put it since the start of the lap. Open **Telemetry** for the position error against the filter's own 2σ bound.
+
+**Camera blackout** (the **Blackout** button, shown whenever the drone you're watching has a camera) cuts the camera for 4 seconds. The drone knows what it doesn't know: it keeps racing through gates it has already pinned down (to within 0.2 m, relative to itself), but for a gate it hasn't, it plans a stop 8 m short, hovers, turns to look where it thinks the gate is, and goes once the camera finds it. With vision + IMU it is also flying on the accelerometer alone, so its own uncertainty (the magenta ball) grows until even known gates are in doubt, then snaps back with the first gate it sees.
 
 **Wind** pushes the drone through drag on its air-relative velocity: a steady wind plus random gusts. A disturbance observer compares the acceleration the drone gets with what its still-air model predicted, and cancels the difference. The planner also keeps back enough thrust for the forecast wind.
 
