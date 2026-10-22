@@ -6,7 +6,7 @@ export const QUICK_STARTS = [
   { id: 'race', title: 'Watch a race', text: 'Five autopilots, three laps, one chequered flag.', hash: '#seed=1&d=normal&field=1' },
   { id: 'fly', title: 'Fly it yourself', text: 'Race the autopilot and your own gold ghost.', hash: '#seed=2&d=normal&pilot=manual' },
   { id: 'night', title: 'Night race', text: 'A hard course under LED gates, headlights on.', hash: '#seed=3&d=hard&field=1&night=1' },
-  { id: 'vio', title: 'Find its way', text: 'No GPS: a camera, an accelerometer and a Kalman filter.', hash: '#seed=3&d=hard&nav=vio' },
+  { id: 'vio', title: 'Find its way', text: 'No GPS: it spots the gates in its own camera pixels and tracks itself with a Kalman filter.', hash: '#seed=3&d=hard&nav=vio&eyes=px' },
 ];
 
 const HEAD = /^##\s+(\d{4}-\d{2}-\d{2})(?:\s*\(([^)]*)\))?\s*:\s*(.+?)\s*$/;

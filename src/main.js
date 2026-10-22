@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { makeSim, step, GATE_INNER, v3, DIFFICULTIES, NAV_MODES, WIND_MODES, PILOTS, DRONE, navError, shareTraffic, bumpAll, cameraBlackout, cameraDark } from './sim.js';
+import { makeSim, step, GATE_INNER, v3, DIFFICULTIES, NAV_MODES, WIND_MODES, PILOTS, DRONE, navError, shareTraffic, bumpAll, cameraBlackout, cameraDark, EYES } from './sim.js';
 import { makeRace, syncRace, raceGap } from './race.js';
 import { makeGhostRecorder, recordGhost, ghostPose, encodeGhost, decodeGhost } from './ghost.js';
 import { makeTelemetry, resetTelemetry, sampleTelemetry, drawTelemetry } from './telemetry.js';
@@ -61,6 +61,9 @@ const CAM_MODES = ['chase', 'orbit', 'fpv'];
 // ---------- world objects (rebuilt per course) ----------
 let sim, seed = 1, difficulty = 'normal', pilot = 'racing', nav = 'truth', world = new THREE.Group(), racingLine = null;
 let ghosts = [], lineVersion = -1, windMode = 'off';
+// how the camera finds gates: 'model' (a modelled corner detector) or 'pixels' (vision step 3)
+let eyes = 'model';
+const hasCamera = () => nav === 'vision' || nav === 'vio';
 // manual flight: you fly `sim`, the racing-line autopilot flies `rival` on the same course
 let rival = null, race = null, pb = null;
 // ghost replay: a gold drone flying the best lap so far (yours are kept per course)
@@ -253,9 +256,9 @@ function buildWorld() {
 
   const manual = pilot === 'manual';
   // you fly by eye, so your sim knows the true course; the rival uses the chosen nav mode
-  sim = makeSim({ seed, pilot, difficulty, nav: manual ? 'truth' : nav, wind: windMode, launchAt: manual || fieldOn ? COUNTDOWN : null, optimise: !manual });
+  sim = makeSim({ seed, pilot, difficulty, nav: manual ? 'truth' : nav, wind: windMode, launchAt: manual || fieldOn ? COUNTDOWN : null, optimise: !manual, eyes });
   // a race against one rival, unless the whole field is racing
-  rival = manual && !fieldOn ? makeSim({ seed, pilot: 'racing', difficulty, nav, wind: windMode, launchAt: COUNTDOWN }) : null;
+  rival = manual && !fieldOn ? makeSim({ seed, pilot: 'racing', difficulty, nav, wind: windMode, launchAt: COUNTDOWN, eyes }) : null;
   race = rival ? makeRace() : null;
   pb = manual ? loadPb() : null;
   ghostRec = makeGhostRecorder(manual ? loadGhost() : null);
@@ -889,6 +892,7 @@ const NAV_NOTES = {
   vio: '<b>Vision + IMU.</b> Now the drone doesn\'t know where <i>it</i> is either: just a noisy, biased accelerometer and the camera. A Kalman filter estimates its position (magenta ball, 2σ) and every gate together. The red ball is the IMU alone: it drifts metres off every lap. Press <b>Blackout</b> (B) to cut its camera and watch the ball grow.',
   blind: '<b>Map only.</b> The drone trusts a map with every gate up to 2.6 m out (cyan), so it misses gates. As a ghost run, it flies straight through any frame it meets.',
 };
+const EYES_NOTE = '<b>Eyes: pixels.</b> It finds the gates in its own 320×180 camera picture (inset): green, found; dashed, where its map says.';
 const coarse = matchMedia('(pointer: coarse)').matches;
 const MANUAL_CONTROLS = coarse
   ? '<b>You fly.</b> Left stick: speed and turn. Right stick: climb and drift (height is held for you).'
@@ -902,7 +906,8 @@ function fieldNote() {
 let noteTimer;
 function showNavNote() {
   const el = $('nav-note');
-  const html = field ? fieldNote() : pilot === 'manual' ? MANUAL_NOTE : NAV_NOTES[nav];
+  let html = field ? fieldNote() : pilot === 'manual' ? MANUAL_NOTE : NAV_NOTES[nav];
+  if (html && !field && pilot !== 'manual' && eyes === 'pixels' && hasCamera()) html += ' ' + EYES_NOTE;
   el.innerHTML = html ?? '';
   el.hidden = !html;
   el.classList.remove('fade');
@@ -928,6 +933,11 @@ $('b-diff').onclick = () => {
 };
 $('b-nav').onclick = () => {
   nav = NAV_MODES[(NAV_MODES.indexOf(nav) + 1) % NAV_MODES.length];
+  syncButtons();
+  buildWorld();
+};
+$('b-eyes').onclick = () => {
+  eyes = EYES[(EYES.indexOf(eyes) + 1) % EYES.length];
   syncButtons();
   buildWorld();
 };
@@ -975,6 +985,9 @@ const NAV_LABELS = { truth: 'ground truth', vision: 'vision', vio: 'vision + IMU
 function syncButtons() {
   $('b-diff').textContent = `Course: ${difficulty}`;
   $('b-nav').textContent = `Nav: ${NAV_LABELS[nav]}`;
+  $('b-eyes').hidden = !hasCamera();
+  $('b-eyes').textContent = `Eyes: ${eyes === 'pixels' ? 'pixels' : 'corner model'}`;
+  $('b-eyes').classList.toggle('on', eyes === 'pixels');
   $('b-wind').textContent = `Wind: ${windMode}`;
   $('b-pilot').textContent = `Pilot: ${PILOT_LABELS[pilot]}`;
   $('b-field').textContent = fieldOn ? `Field: ${1 + rosterFor({ pilot, nav }).length} drones` : 'Field: solo';
@@ -994,6 +1007,7 @@ function readHash() {
   seed = Number.isInteger(n) && n > 0 && n < 1e9 ? n : 1;
   difficulty = DIFFICULTIES.includes(p.get('d')) ? p.get('d') : 'normal';
   nav = NAV_MODES.includes(p.get('nav')) ? p.get('nav') : 'truth';
+  eyes = p.get('eyes') === 'px' ? 'pixels' : 'model';
   windMode = WIND_MODES.includes(p.get('wind')) ? p.get('wind') : 'off';
   pilot = PILOTS.includes(p.get('pilot')) ? p.get('pilot') : 'racing';
   fieldOn = p.get('field') === '1';
@@ -1001,11 +1015,11 @@ function readHash() {
   syncButtons();
 }
 function writeHash() {
-  const h = `#seed=${seed}&d=${difficulty}${nav === 'truth' ? '' : `&nav=${nav}`}${windMode === 'off' ? '' : `&wind=${windMode}`}${pilot === 'racing' ? '' : `&pilot=${pilot}`}${fieldOn ? '&field=1' : ''}${night ? '&night=1' : ''}`;
+  const h = `#seed=${seed}&d=${difficulty}${nav === 'truth' ? '' : `&nav=${nav}`}${eyes === 'pixels' && hasCamera() ? '&eyes=px' : ''}${windMode === 'off' ? '' : `&wind=${windMode}`}${pilot === 'racing' ? '' : `&pilot=${pilot}`}${fieldOn ? '&field=1' : ''}${night ? '&night=1' : ''}`;
   if (location.hash !== h) history.replaceState(null, '', h);
 }
 addEventListener('hashchange', () => {
-  const key = () => `${seed}/${difficulty}/${nav}/${windMode}/${pilot}/${fieldOn}`;
+  const key = () => `${seed}/${difficulty}/${nav}/${eyes}/${windMode}/${pilot}/${fieldOn}`;
   const before = key();
   const wasNight = night;
   readHash();
@@ -1098,6 +1112,7 @@ addEventListener('keydown', (e) => {
   if (e.key === 'd') $('b-diff').click();
   if (e.key === 'v') $('b-nav').click();
   if (e.key === 'b' && !$('b-dark').hidden) $('b-dark').click();
+  if (e.key === 'e' && !$('b-eyes').hidden) $('b-eyes').click();
   if (e.key === 'w') $('b-wind').click();
   if (e.key === 't') $('b-tm').click();
   if (e.key === 'g') $('b-ghost').click();
@@ -1125,7 +1140,57 @@ function toScreen(p, rect) {
   ovV.applyMatrix4(fpvCam.projectionMatrix);
   return [rect.x + ((ovV.x + 1) / 2) * rect.w, rect.top + ((1 - ovV.y) / 2) * rect.h];
 }
-function drawOverlay(rect, label) {
+// Vision step 3: the drone's own camera picture (what the detector really works on), with
+// the quads it found (green: fused, red: thrown out, amber: no gate it could put to it)
+// and, dashed, where its map said each gate would be.
+const eyeCanvas = document.createElement('canvas'), eyeCtx = eyeCanvas.getContext('2d');
+let eyeT = -1;
+function drawEye(r, frame) {
+  const img = frame.img;
+  if (!img) return;
+  if (eyeCanvas.width !== img.W) { eyeCanvas.width = img.W; eyeCanvas.height = img.H; }
+  if (frame.t !== eyeT) {
+    eyeT = frame.t;
+    eyeCtx.putImageData(new ImageData(img.rgb, img.W, img.H), 0, 0);
+  }
+  octx.save();
+  octx.beginPath();
+  octx.rect(r.x, r.top, r.w, r.h);
+  octx.clip();
+  octx.imageSmoothingEnabled = false;
+  octx.drawImage(eyeCanvas, r.x, r.top, r.w, r.h);
+  octx.imageSmoothingEnabled = true;
+  const sx = r.w / img.W, sy = r.h / img.H;
+  const poly = (c) => {
+    octx.beginPath();
+    c.forEach(([u, v], i) => (i ? octx.lineTo(r.x + u * sx, r.top + v * sy) : octx.moveTo(r.x + u * sx, r.top + v * sy)));
+    octx.closePath();
+  };
+  octx.lineWidth = 1;
+  octx.setLineDash([3, 3]);
+  octx.strokeStyle = 'rgba(77, 210, 255, .8)';
+  for (const p of frame.pred ?? []) { poly(p.corners); octx.stroke(); }
+  octx.setLineDash([]);
+  octx.lineWidth = 1.5;
+  octx.font = '700 11px ui-sans-serif, system-ui, sans-serif';
+  for (const q of frame.quads ?? []) {
+    const col = q.ok ? '#3ddc97' : q.gate !== undefined ? '#ff5c5c' : '#ffc04d';
+    octx.strokeStyle = octx.fillStyle = col;
+    poly(q.corners);
+    octx.stroke();
+    if (q.gate !== undefined) {
+      const top = q.corners.reduce((a, b) => (b[1] < a[1] ? b : a));
+      octx.fillText(String(q.gate + 1), r.x + top[0] * sx + 3, r.top + top[1] * sy - 3);
+    }
+  }
+  octx.strokeStyle = 'rgba(255, 255, 255, .25)';
+  octx.lineWidth = 1;
+  octx.strokeRect(r.x + 0.5, r.top + 0.5, r.w - 1, r.h - 1);
+  octx.restore();
+}
+// rect: the onboard view the detections are drawn over (null: none); eyeRect: where the
+// drone's own picture goes, when it has one.
+function drawOverlay(rect, label, eyeRect = null) {
   const vs = viewSim(), frame = vs.vision?.frame;
   if (!frame && !overlayDrawn) return;
   octx.setTransform(1, 0, 0, 1, 0, 0);
@@ -1133,13 +1198,18 @@ function drawOverlay(rect, label) {
   overlayDrawn = !!frame;
   if (!frame) return;
   octx.setTransform(overlayDpr, 0, 0, overlayDpr, 0, 0);
+  let found = 0;
+  const fresh = vs.t - frame.t < 0.2;
+  if (eyeRect && fresh && !frame.dark) {
+    drawEye(eyeRect, frame);
+    if (!rect) found = frame.dets.filter((d) => d.ok).length;
+  }
+  if (!rect) rect = eyeRect;
   octx.save();
   octx.beginPath();
   octx.rect(rect.x, rect.top, rect.w, rect.h);
   octx.clip();
   octx.lineWidth = 1.5;
-  let found = 0;
-  const fresh = vs.t - frame.t < 0.2;
   if (fresh && frame.dark) {
     // camera blackout: no picture, just static
     octx.fillStyle = 'rgba(8, 10, 14, .82)';
@@ -1159,7 +1229,7 @@ function drawOverlay(rect, label) {
     octx.fillText(`camera back in ${left.toFixed(1)} s`, rect.x + rect.w / 2, cy + 18);
     octx.textAlign = 'start';
   }
-  for (const det of fresh ? frame.dets : []) {
+  for (const det of fresh && rect !== eyeRect ? frame.dets : []) {
     const pts = det.world.map((p) => toScreen(p, rect));
     if (pts.some((q) => !q)) continue;
     if (det.ok) found++;
@@ -1179,7 +1249,7 @@ function drawOverlay(rect, label) {
     octx.fillStyle = 'rgba(11, 18, 32, .6)';
     octx.fillRect(label.x, label.y, 112, 18);
     octx.fillStyle = frame.dark ? '#ff7a7a' : found ? '#3ddc97' : '#8fa0b8';
-    octx.fillText(frame.dark ? 'VISION · dark' : `VISION · ${found} gate${found === 1 ? '' : 's'}`, label.x + 6, label.y + 13);
+    octx.fillText(frame.dark ? 'VISION · dark' : `${frame.img ? 'PIXELS' : 'VISION'} · ${found} gate${found === 1 ? '' : 's'}`, label.x + 6, label.y + 13);
   }
 }
 
@@ -1282,6 +1352,14 @@ function frame(now) {
   if (padsOn) $('pads').style.bottom = `${padsBottom}px`;
   renderer.setScissorTest(false);
   renderer.setViewport(0, 0, W, H);
+  // picture-in-picture onboard view, kept clear of the control buttons; with Eyes: pixels it
+  // shows the drone's own camera picture instead
+  if (frameNo % 30 === 0) controlsTop = controls.getBoundingClientRect().top;
+  const w = Math.round(Math.min(Math.max(W * 0.3, 160), 360)), h = Math.round(w * 9 / 16);
+  const x = W - w - 14, y = Math.max(78, H * 0.12, padsOn ? padsBottom + $('pad-r').offsetHeight + 10 : H - controlsTop + 10);
+  const pip = { x, top: H - y - h, w, h };
+  const eyeOn = !!viewSim().vision?.eye;
+  const lbl = $('fpv-label');
   if (camMode === 'fpv') {
     fpvCam.aspect = W / H;
     fpvCam.updateProjectionMatrix();
@@ -1289,28 +1367,26 @@ function frame(now) {
     vm.visible = false;
     renderer.render(scene, fpvCam);
     vm.visible = true;
-    drawOverlay({ x: 0, top: 0, w: W, h: H }, W >= 700 ? { x: W / 2 - 56, y: 16 } : null);
-    $('fpv-label').style.display = 'none';
+    drawOverlay({ x: 0, top: 0, w: W, h: H }, W >= 700 ? { x: W / 2 - 56, y: 16 } : null, eyeOn ? pip : null);
   } else {
     renderer.render(scene, chaseCam);
-    // picture-in-picture onboard view, kept clear of the control buttons
-    if (frameNo % 30 === 0) controlsTop = controls.getBoundingClientRect().top;
-    const w = Math.round(Math.min(Math.max(W * 0.3, 160), 360)), h = Math.round(w * 9 / 16);
-    const x = W - w - 14, y = Math.max(78, H * 0.12, padsOn ? padsBottom + $('pad-r').offsetHeight + 10 : H - controlsTop + 10);
-    fpvCam.aspect = w / h;
-    fpvCam.updateProjectionMatrix();
-    renderer.setScissorTest(true);
-    renderer.setScissor(x, y, w, h);
-    renderer.setViewport(x, y, w, h);
-    const vm = viewMesh();
-    vm.visible = false;
-    renderer.render(scene, fpvCam);
-    vm.visible = true;
-    drawOverlay({ x, top: H - y - h, w, h }, w >= 180 ? { x: x + 6, y: H - y - h + 6 } : null);
-    const lbl = $('fpv-label');
-    lbl.style.display = 'block';
-    lbl.style.bottom = `${y + h + 4}px`;
+    if (!eyeOn) {
+      fpvCam.aspect = w / h;
+      fpvCam.updateProjectionMatrix();
+      renderer.setScissorTest(true);
+      renderer.setScissor(x, y, w, h);
+      renderer.setViewport(x, y, w, h);
+      const vm = viewMesh();
+      vm.visible = false;
+      renderer.render(scene, fpvCam);
+      vm.visible = true;
+    }
+    drawOverlay(eyeOn ? null : pip, w >= 180 ? { x: x + 6, y: H - y - h + 6 } : null, eyeOn ? pip : null);
   }
+  lbl.style.display = camMode === 'fpv' && !eyeOn ? 'none' : 'block';
+  lbl.style.bottom = `${y + h + 4}px`;
+  const lblText = eyeOn ? (w >= 240 ? "Drone's eye · 320×180 pixels" : "Drone's eye") : 'Onboard camera';
+  if (lbl.textContent !== lblText) lbl.textContent = lblText;
   requestAnimationFrame(frame);
 }
 

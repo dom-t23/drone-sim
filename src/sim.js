@@ -2,6 +2,8 @@
 // Pure JavaScript with no rendering dependencies, so it runs in the browser and in Node tests.
 // Coordinates: metres, seconds; Y is up.
 
+import { EYE, buildScene, renderView, detectGates, associate, toPlane, toPixel } from './eye.js';
+
 export const G = 9.81;
 
 // ---------- small vector helpers (arrays [x, y, z]) ----------
@@ -23,6 +25,7 @@ export const v3 = {
 
 // ---------- course ----------
 export const GATE_INNER = 3.2; // inner opening width/height, metres
+const FRAME_BAR = 0.28; // gate frame bar thickness, metres (FRAME.bar)
 
 // Course presets. 'normal' is the original layout and must stay byte-for-byte the same
 // (tests and shared links depend on it); the others draw extra random numbers after it.
@@ -504,6 +507,8 @@ function dodge(sim, me, qa, speed) {
 // own position and attitude are still taken as known: estimating those is step 2.
 
 export const NAV_MODES = ['truth', 'vision', 'vio', 'blind'];
+// how the camera finds gates: a model of a corner detector, or real pixels (vision step 3)
+export const EYES = ['model', 'pixels'];
 
 export const CAMERA = {
   vfov: 85 * DEG, // vertical field of view, same as the rendered onboard camera
@@ -580,8 +585,8 @@ export function project(cam, p) {
 
 // Corners of a gate's inner opening, in order round the frame.
 const CORNERS = [[-1, 1], [1, 1], [1, -1], [-1, -1]];
-export function gateCorners(g, pos = g.pos, right = g.right, up = g.up) {
-  const h = GATE_INNER / 2;
+export function gateCorners(g, pos = g.pos, right = g.right, up = g.up, size = GATE_INNER) {
+  const h = size / 2;
   return CORNERS.map(([a, b]) => [
     pos[0] + (right[0] * a + up[0] * b) * h,
     pos[1] + (right[1] * a + up[1] * b) * h,
@@ -608,10 +613,10 @@ function rotVec(v, w) {
 // from the mapped orientation; a weak prior on that rotation keeps far-off gates, whose
 // orientation the camera can barely see, well posed. Returns the centre, its 3x3
 // covariance and the final misfit (chi-square), or null if the fit fails.
-export function solveGatePose(cam, uv, start, sigma) {
+export function solveGatePose(cam, uv, start, sigma, size = GATE_INNER) {
   const residuals = (x) => {
     const w = [x[3], x[4], x[5]];
-    const corners = gateCorners(start, [x[0], x[1], x[2]], rotVec(start.right, w), rotVec(start.up, w));
+    const corners = gateCorners(start, [x[0], x[1], x[2]], rotVec(start.right, w), rotVec(start.up, w), size);
     const r = new Array(11);
     for (let j = 0; j < 4; j++) {
       const q = project(cam, corners[j]);
@@ -785,7 +790,8 @@ function visionFrame(sim) {
   const camEst = sim.est ? cameraPose(navState(sim)) : cam;
   const tanV = Math.tan(C.vfov / 2), tanH = tanV * C.aspect, px = (2 * tanV) / C.heightPx;
   const dets = [];
-  for (const g of sim.course.gates) {
+  if (V.eye) pixelDetections(sim, cam, camEst, dets);
+  else for (const g of sim.course.gates) {
     // what the camera really sees: the true gates
     const d = v3.sub(g.pos, cam.pos), range = v3.len(d);
     if (range > C.maxRange || range < 2) continue;
@@ -825,7 +831,7 @@ function visionFrame(sim) {
     });
     dets.push({ gate: g.id, uv, world, ok, wild });
   }
-  V.frame = { t: sim.t, dets };
+  V.frame = { t: sim.t, dets, img: V.eye?.img ?? null, quads: V.eye?.quads ?? null, pred: V.eye?.pred ?? null };
   V.stats.frames++;
   if (sim.est) syncBelief(sim);
   // after the first lap every gate has been seen: re-shape the line for the real course
@@ -841,9 +847,75 @@ function visionFrame(sim) {
   }
 }
 
+// Vision step 3, the pixel camera: draw what the drone would really see, find the orange
+// quads in it, decide which gate each one is from where the drone expects the gates to be
+// (it is never told), then fit, gate and fuse exactly like the corner model above.
+export const PIXELS = {
+  outer: GATE_INNER + 2 * FRAME_BAR, // the detector finds the frame's outer edge
+  sigmaPx: 1.0, // corner noise it assumes, image pixels (320 x 180 picture)
+  maxRange: 60, // m: gates further than this aren't looked for
+  settle: 25, // m: inside this, the next gate's crossing only moves towards its centre
+  offsetDoubt: [0.15, 0.4], // m: a gate pinned down this well is crossed where the shaped line wants; this doubtful, at its believed centre
+};
+function pixelDetections(sim, cam, camEst, dets) {
+  const V = sim.vision, E = V.eye, tanV = Math.tan(CAMERA.vfov / 2), C = PIXELS;
+  E.img = renderView(cam, E.boxes, tanV, V.rand, E.img);
+  // where it expects each gate's outer corners in the picture
+  const pred = [];
+  for (const b of sim.belief.gates) {
+    const d = v3.sub(b.pos, camEst.pos);
+    if (v3.len(d) > C.maxRange || v3.dot(d, camEst.fwd) < 1) continue;
+    const pj = gateCorners(b, b.pos, b.right, b.up, C.outer).map((p) => project(camEst, p));
+    if (pj.some((q) => !q)) continue;
+    pred.push({ id: b.id, corners: pj.map(([x, y]) => toPixel(x, y, tanV)) });
+  }
+  E.pred = pred;
+  E.quads = detectGates(E.img, pred);
+  const px = (2 * tanV) / EYE.H;
+  for (const m of associate(E.quads, pred)) {
+    const g = sim.course.gates[m.id], b = sim.belief.gates[m.id];
+    const uv = m.corners.map(([u, v]) => toPlane(u, v, tanV));
+    // what it sees is the face of the frame nearest the camera, half a bar in front of the
+    // gate's centre plane: fit that face, then step back to the centre
+    const face = v3.scale(b.normal, (v3.dot(v3.sub(camEst.pos, b.pos), b.normal) > 0 ? 1 : -1) * FRAME_BAR / 2);
+    const fit = solveGatePose(camEst, uv, { ...b, pos: v3.add(b.pos, face) }, C.sigmaPx * px, C.outer);
+    if (fit) fit.pos = v3.sub(fit.pos, face);
+    const ok = !!fit && fit.chi2 < VISION.chi2Fit && (sim.est ? fuseLandmark(sim, m.id, fit) : fuse(b, fit.pos, fit.cov));
+    V.stats[ok ? 'accepted' : 'rejected']++;
+    m.quad.gate = m.id;
+    m.quad.ok = ok;
+    // measured corners as world points at the true corner depth, for the onboard overlay
+    const world = gateCorners(g, g.pos, g.right, g.up, C.outer).map((p, j) => {
+      const z = v3.dot(v3.sub(p, cam.pos), cam.fwd);
+      return v3.add(cam.pos, v3.scale(v3.add(cam.fwd, v3.add(v3.scale(cam.right, uv[j][0]), v3.scale(cam.up, uv[j][1]))), z));
+    });
+    dets.push({ gate: m.id, uv, world, ok, wild: false });
+  }
+  V.stats.lost += E.quads.length - dets.length; // blobs it couldn't put a gate to
+}
+
+// With the pixel camera, gates come into sight later and some are only glimpsed, so the
+// line leaves room for what it doesn't know: a gate's crossing point is pulled from its
+// shaped offset towards the believed centre the less sure the drone is of that gate (see
+// PIXELS.offsetDoubt). Once a gate is pinned down, the line crosses it where the shaping
+// wanted.
+// The gate it is about to fly through is never swung out further once it is close (a late
+// change of line is harder to follow than a slightly slower crossing).
+function shapeFor(sim) {
+  if (sim.eyes !== 'pixels' || !sim.shape) return sim.shape;
+  const V = sim.vision, me = navState(sim).pos;
+  V.offsetF ??= sim.shape.map(() => 0);
+  return sim.shape.map((sh, i) => {
+    let f = Math.max(0, Math.min(1, (PIXELS.offsetDoubt[1] - gateDoubt(sim, i)) / (PIXELS.offsetDoubt[1] - PIXELS.offsetDoubt[0])));
+    if (i === sim.state.target && v3.len(v3.sub(sim.belief.gates[i].pos, me)) < PIXELS.settle) f = Math.min(f, V.offsetF[i]);
+    V.offsetF[i] = f;
+    return { ...sh, dr: sh.dr * f, du: sh.du * f };
+  });
+}
+
 function replan(sim) {
   const V = sim.vision, s = sim.plan.pts[sim.track.idx].s;
-  const plan = planRacingLine(sim.belief, { ...sim.planOpts, shape: sim.shape });
+  const plan = planRacingLine(sim.belief, { ...sim.planOpts, shape: shapeFor(sim) });
   sim.plan = plan;
   sim.track.idx = nearestIndex(plan, navState(sim).pos, Math.round(s / plan.ds) % plan.pts.length, 60, 60);
   sim.planVersion++;
@@ -1174,7 +1246,7 @@ export function manualPilot(sim, dt) {
 // of the real airframe (the rendered model is drawn larger than life). A glancing touch
 // just pushes it off; a real hit cuts the motors, it tumbles to the ground and respawns
 // on the line just after the last gate it passed, so a crash costs time, never progress.
-export const FRAME = { bar: 0.28, legRadius: 0.06 };
+export const FRAME = { bar: FRAME_BAR, legRadius: 0.06 };
 export const CRASH = {
   radius: 0.3, // m, drone collision sphere
   minSpeed: 1.5, // m/s into the surface: slower touches only push the drone off
@@ -1447,8 +1519,9 @@ export const GRID = { spacing: 2.2 };
 export function gridOffset(slot) {
   return slot ? (slot % 2 ? -1 : 1) * Math.ceil(slot / 2) * GRID.spacing : 0;
 }
-export function makeSim({ seed = 1, gates, pilot = 'racing', difficulty = 'normal', nav = 'truth', optimise = true, wind = 'off', observer = true, launchAt = null, crashes, tune = null, slot = 0 } = {}) {
+export function makeSim({ seed = 1, gates, pilot = 'racing', difficulty = 'normal', nav = 'truth', optimise = true, wind = 'off', observer = true, launchAt = null, crashes, tune = null, slot = 0, eyes = 'model' } = {}) {
   const course = makeCourse({ seed, gates, difficulty });
+  const scenery = makeScenery(course, seed);
   if (!NAV_MODES.includes(nav)) nav = 'truth';
   const belief = nav === 'truth' ? null : makeMap(course, seed);
   const camera = nav === 'vision' || nav === 'vio';
@@ -1480,7 +1553,7 @@ export function makeSim({ seed = 1, gates, pilot = 'racing', difficulty = 'norma
   const sim = {
     // map-only flies through frames like a ghost run, so you can watch every miss
     crashes: crashes ?? nav !== 'blind',
-    scenery: makeScenery(course, seed),
+    scenery,
     start: { pos: drone.pos.slice(), yaw: drone.yaw },
     crash: null, // { t, until, what, gate } while tumbling
     respawnAt: -Infinity,
@@ -1500,7 +1573,10 @@ export function makeSim({ seed = 1, gates, pilot = 'racing', difficulty = 'norma
       heldAt: 0, // ...and the gate count it will have reached once through it
       resumeAt: -Infinity, // when it last set off again after a blind stop
       stats: { frames: 0, accepted: 0, rejected: 0, lost: 0, wild: 0, wildRejected: 0, replans: 0 },
+      // the pixel camera (vision step 3): the scene it draws, its latest picture and quads
+      eye: eyes === 'pixels' ? { boxes: buildScene(course.gates, scenery.pillars, { inner: GATE_INNER, bar: FRAME_BAR, legRadius: FRAME.legRadius }), img: null, quads: [] } : null,
     } : null,
+    eyes: camera && eyes === 'pixels' ? 'pixels' : 'model',
     plan,
     shape,
     planOpts,
@@ -1518,6 +1594,11 @@ export function makeSim({ seed = 1, gates, pilot = 'racing', difficulty = 'norma
     events: [],
   };
   sim.est = nav === 'vio' ? makeEstimator(sim, seed) : null; // visual-inertial navigation filter
+  if (sim.eyes === 'pixels' && sim.shape) {
+    // nothing seen yet: start on a line through the centre of every mapped gate
+    sim.plan = planRacingLine(belief, { ...planOpts, shape: shapeFor(sim) });
+    sim.track.idx = nearestIndex(sim.plan, drone.pos, 0, 0, sim.plan.pts.length);
+  }
   return sim;
 }
 
@@ -1644,6 +1725,7 @@ export const BLACKOUT = {
   secs: 4, // how long the button cuts the camera
   trust: 0.2, // m: the next gate's 1-sigma doubt (relative to the drone) it will race through blind
   stop: 8, // m: how far short of a doubtful gate it stops (gates can be 2.6 m off the map)
+  stopPixels: 11, // m: the same with the pixel camera
   brake: 6, // m/s^2: the braking it plans that stop with
   patience: 3, // s: once it can see again, it waits at most this long to find the gate
   turnRate: 2, // rad/s: while stopped, it turns to look at where it thinks the gate is
@@ -1683,6 +1765,9 @@ export function blindCap(sim, me = navState(sim)) {
   const V = sim.vision;
   if (!V) return Infinity;
   const dark = cameraDark(sim), st = sim.state, nG = sim.course.gates.length, P = sim.plan;
+  // the pixel camera (tilted up, like a real FPV camera) loses the bottom of a gate a metre or
+  // two below it from 8 m, so it stops further back to be sure of seeing the whole frame
+  const stop = sim.eyes === 'pixels' ? BLACKOUT.stopPixels : BLACKOUT.stop;
   if (V.held !== null && st.gatesPassed > V.heldAt) V.held = null; // flew through it after all
   // released once the camera has pinned the gate down, or (if it can't find it from where
   // it stopped) after a while anyway: then it flies on as it would on a first lap
@@ -1708,16 +1793,16 @@ export function blindCap(sim, me = navState(sim)) {
     // looks past the next gate too, so a doubtful gate just after a known one doesn't catch
     // it at full speed. A gate too close to stop well short of, even braking half as hard
     // again as planned, it commits to and flies through on what it has.
-    const reach = speed * speed / (2 * BLACKOUT.brake) + BLACKOUT.stop + 5;
+    const reach = speed * speed / (2 * BLACKOUT.brake) + stop + 5;
     for (let k = 0; k < nG; k++) {
       const j = (st.target + k) % nG, dj = dist(j, k);
       if (dj > reach) break;
-      if (gateDoubt(sim, j) > BLACKOUT.trust && speed * speed / (3 * BLACKOUT.brake) <= dj - BLACKOUT.stop / 2) { id = j; ahead = k; break; }
+      if (gateDoubt(sim, j) > BLACKOUT.trust && speed * speed / (3 * BLACKOUT.brake) <= dj - stop / 2) { id = j; ahead = k; break; }
     }
     if (id === null) return Infinity;
   }
   const d = dist(id, ahead);
-  const v = Math.sqrt(2 * BLACKOUT.brake * Math.max(0, d - BLACKOUT.stop));
+  const v = Math.sqrt(2 * BLACKOUT.brake * Math.max(0, d - stop));
   if (V.held === null && v < speed + 1) {
     // from here on it has to brake for it: commit to stopping until it can see the gate
     V.held = id;
