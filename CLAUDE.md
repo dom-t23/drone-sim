@@ -24,7 +24,7 @@ The best features are both. Prefer depth that shows (an inset, an overlay, a cha
    - For any new autopilot or estimation behaviour, check it over a wide sweep (e.g. 30 seeds per difficulty, calm and gusty) before trusting it, and report honestly what fails.
 5. **Document.** Add a dated entry at the top of `CHANGELOG.md` (it feeds the intro card): visible differences first, in plain English, each run's headline bullets led with a bold sentence, then "How it works" and "Tests" bullets. Never overstate: numbers in the changelog must come from runs you actually did. Tick or update `ROADMAP.md`, with "Next steps" for anything unfinished. Keep `README.md` accurate.
 6. **Ship.** Commit with a clear message and push to `main` (or to the epic branch, see below). Fetch and rebase if the push is rejected. Never force-push.
-7. **Final message** (sent to Dom as a push notification): 1–2 lines, no test statistics. What's new and what to try, with a direct link to the demo (a `#...` link straight into the new feature when there is one). On a night that only advanced an unfinished epic, say so in one line.
+7. **Final message**: 1–2 lines, no test statistics: what's new and what to try, with a direct link to the demo (a `#...` link straight into the new feature when there is one). On a night that only advanced an unfinished epic, say so in one line. **Don't send push notifications**: Dom has turned them off for this project, so never call a notification tool, even on failure.
 
 ## Multi-night epics
 
