@@ -1,5 +1,7 @@
 import * as THREE from 'three';
-import { makeSim, step, GATE_INNER, v3, DIFFICULTIES, NAV_MODES, WIND_MODES, PILOTS, DRONE, navError, shareTraffic, bumpAll, cameraBlackout, cameraDark, EYES } from './sim.js';
+import { makeSim, step, GATE_INNER, v3, DIFFICULTIES, NAV_MODES, WIND_MODES, PILOTS, DRONE, FRAME, navError, shareTraffic, bumpAll, cameraBlackout, cameraDark, EYES } from './sim.js';
+import { buildScene } from './eye.js';
+import { TV, makeDirector, subjectsOf, direct, pinSubject, replayShot, endReplay, makeReplay, recordReplay, replayPose, replayWindow } from './director.js';
 import { makeRace, syncRace, raceGap } from './race.js';
 import { makeGhostRecorder, recordGhost, ghostPose, encodeGhost, decodeGhost } from './ghost.js';
 import { makeTelemetry, resetTelemetry, sampleTelemetry, drawTelemetry } from './telemetry.js';
@@ -55,8 +57,10 @@ scene.add(grid);
 // ---------- cameras ----------
 const chaseCam = new THREE.PerspectiveCamera(62, innerWidth / innerHeight, 0.1, 600);
 const fpvCam = new THREE.PerspectiveCamera(85, 16 / 9, 0.05, 400);
-let camMode = 'chase'; // chase | orbit | fpv
-const CAM_MODES = ['chase', 'orbit', 'fpv'];
+let camMode = 'chase'; // chase | orbit | fpv | tv
+const CAM_MODES = ['chase', 'orbit', 'fpv', 'tv'];
+const CAM_LABELS = { chase: 'chase', orbit: 'orbit', fpv: 'onboard', tv: 'TV' };
+const CHASE_FOV = 62;
 
 // ---------- world objects (rebuilt per course) ----------
 let sim, seed = 1, difficulty = 'normal', pilot = 'racing', nav = 'truth', world = new THREE.Group(), racingLine = null;
@@ -75,6 +79,12 @@ const COUNTDOWN = 3; // s on the pad before a race starts
 let fieldOn = false, field = null, followId = 'hero', lastLeader = null;
 let fieldSims = [], flagShown = false; // all the field's sims, for traffic and contact
 const HERO_COLOR = '#ff8a3d';
+// TV mode: a race director cutting between trackside posts, flybys, chase, heli and onboard
+// shots, with slow-motion replays of crashes, lead changes, laps and the chequered flag.
+// During a replay the race is paused and every drone flies its recorded poses again.
+let director = null, replayBuf = makeReplay(), replay = null, replayQueue = null, lastReplay = -Infinity;
+let tvSeen = new Map(), tvShot = null, labelZoom = 1;
+const tvOn = () => camMode === 'tv';
 const telemetry = makeTelemetry($('telemetry'));
 scene.add(world);
 
@@ -305,7 +315,125 @@ function buildWorld() {
   trailCount = 0;
   lastEvents = 0;
   darkWatch = null;
+  director = null;
+  stopReplay();
   updateHud(true);
+}
+
+// ---------- TV mode ----------
+function tvEntries() {
+  return field ? field.entries : [{ id: 'hero', name: heroName(), color: HERO_COLOR, sim, mesh: drone }];
+}
+function buildDirector() {
+  const boxes = buildScene(sim.course.gates, sim.scenery.pillars, { inner: GATE_INNER, bar: FRAME.bar, legRadius: FRAME.legRadius });
+  director = makeDirector({ course: sim.course, plan: (rival ?? sim).plan, boxes, seed });
+  replayBuf = makeReplay();
+  replayQueue = null;
+  lastReplay = -Infinity;
+  tvSeen = new Map();
+}
+// Ask for a replay of drone id around sim time te. Higher prio wins; the flag always does.
+function queueReplay(id, te, title, prio) {
+  if (!tvOn() || !director || replay || pilot === 'manual') return;
+  if (prio < 4 && sim.t - lastReplay < TV.replay.cooldown) return;
+  if (replayQueue && replayQueue.prio >= prio) return;
+  replayQueue = { id, te, title, prio, at: te + TV.replay.after };
+}
+// New crashes (any drone) and, flying solo, every second lap.
+function tvWatch() {
+  for (const e of tvEntries()) {
+    const ev = e.sim.events;
+    if (!tvSeen.has(e.id)) tvSeen.set(e.id, ev.length);
+    for (let i = tvSeen.get(e.id); i < ev.length; i++) {
+      const x = ev[i];
+      if (x.type === 'crash') queueReplay(e.id, x.t, `${e.id === 'hero' && !field ? 'Crash' : `${e.name} crashes`}`, 3);
+      if (x.type === 'lap' && !field && e.sim.state.laps.length % 2 === 0) {
+        // flying solo: every second lap, the fastest gate of that lap that is still in the buffer
+        let best = null;
+        for (const g of ev) {
+          if (g.type !== 'gate' || g.t < x.t - x.time || g.t < sim.t - TV.replay.keep + TV.replay.before) continue;
+          const p = replayPose(replayBuf, e.id, g.t), v = p ? v3.len(p.vel) : 0;
+          if (!best || v > best.v) best = { g, v };
+        }
+        if (best) queueReplay(e.id, best.g.t, `Lap ${e.sim.state.laps.length} · ${x.time.toFixed(2)} s · fastest gate ${best.g.gate + 1}, ${(best.v * 3.6).toFixed(0)} km/h`, 1);
+      }
+    }
+    tvSeen.set(e.id, ev.length);
+  }
+  if (replayQueue && sim.t >= replayQueue.at) startReplay();
+}
+let wipeTimer;
+function startReplay() {
+  const q = replayQueue;
+  replayQueue = null;
+  const w = replayWindow(replayBuf, q.te), pose = w && replayPose(replayBuf, q.id, q.te);
+  if (!pose) return;
+  replayShot(director, q.id, pose.pos, pose.vel);
+  replay = { ...w, t: w.from, id: q.id, title: q.title };
+  lastReplay = sim.t;
+  document.body.classList.add('replaying');
+  $('tv-skip').hidden = false;
+  const wipe = $('tv-wipe');
+  wipe.classList.remove('go');
+  void wipe.offsetWidth; // restart the animation
+  wipe.classList.add('go');
+  clearTimeout(wipeTimer);
+  wipeTimer = setTimeout(() => wipe.classList.remove('go'), 1000);
+}
+function stopReplay() {
+  if (!replay) return;
+  replay = null;
+  if (director) endReplay(director);
+  document.body.classList.remove('replaying');
+  $('tv-skip').hidden = true;
+  trailCount = 0; // the trail restarts from where the drone is now
+}
+$('tv-skip').onclick = () => stopReplay();
+// Fly every drone's recorded pose at the replay clock.
+function applyReplay(dtFrame) {
+  replay.t += dtFrame * TV.replay.speed;
+  if (replay.t >= replay.to) { stopReplay(); return; }
+  for (const e of tvEntries()) {
+    const p = replayPose(replayBuf, e.id, replay.t);
+    if (!p) continue;
+    syncMesh(e.mesh, p);
+    e.label?.position.set(p.pos[0], p.pos[1] + 1.1, p.pos[2]);
+  }
+  ghostMesh.visible = false;
+  estMesh.visible = drMesh.visible = estLine.visible = false;
+}
+function tvSubjects() {
+  if (!replay) return subjectsOf(tvEntries());
+  return tvEntries().map((e) => {
+    const p = replayPose(replayBuf, e.id, replay.t);
+    return p && { id: e.id, name: e.name, pos: p.pos, vel: p.vel, yaw: p.yaw, flying: true, crashed: false, progress: 0, leg: 1 };
+  }).filter(Boolean);
+}
+// The TV graphics: LIVE / REPLAY bug with the shot name, and a lower third for the drone in shot.
+let tvHtml = '';
+function updateTvGraphics(H) {
+  const el = $('tv');
+  el.hidden = !tvOn() || !tvShot;
+  if (el.hidden) return;
+  el.style.bottom = `${H - controlsTop + 10}px`;
+  if (frameNo % 3 !== 0 && !tvShot.cut) return;
+  const e = tvEntries().find((x) => x.id === tvShot.subject) ?? tvEntries()[0];
+  const p = replay ? replayPose(replayBuf, e.id, replay.t) : e.sim.drone;
+  const kmh = p ? (v3.len(p.vel) * 3.6).toFixed(0) : '–';
+  let info;
+  if (replay) info = `${esc(replay.title)} · ${TV.replay.speed}× · ${kmh} km/h`;
+  else if (field) {
+    const r = standings(field, sim.course.gates.length).find((x) => x.id === e.id);
+    info = `P${r.pos} · lap ${Math.min(field.laps, Math.max(1, r.lap))}/${field.laps} · ${kmh} km/h${e.sim.crash ? ' · <em>crashed</em>' : ''}`;
+  } else info = `lap ${Math.max(1, e.sim.state.lap)} · ${kmh} km/h${e.sim.crash ? ' · <em>crashed</em>' : ''}`;
+  // the bug and the lower third are rebuilt (and slide in) only when the shot or the drone
+  // changes; the live numbers just update in place
+  const head = `<div class="tv-bug"><span class="tv-live${replay ? ' rp' : ''}">${replay ? 'Replay' : 'Live'}</span><span>${esc(tvShot.label)}</span>${director?.pin ? '<span class="tv-pin">pinned</span>' : ''}</div>`
+    + `<div class="tv-l3" style="border-color:${e.color}"><i style="background:${e.color}"></i><b>${esc(e.name)}</b><span id="tv-info"></span></div>`;
+  if (head !== tvHtml) $('tv-body').innerHTML = tvHtml = head;
+  const inf = $('tv-info');
+  if (inf.innerHTML !== info) inf.innerHTML = info;
+  $('tv-skip').style.bottom = `${H - controlsTop + 16 + el.offsetHeight}px`;
 }
 
 // Planned racing line, coloured by planned speed (blue = braking for a turn, orange = flat
@@ -501,6 +629,7 @@ function updateField() {
     flagShown = true;
     const win = field.entries.find((e) => e.id === field.order[0]);
     toast(`Chequered flag: ${win.id === 'hero' && pilot === 'manual' ? 'you win!' : `${win.name} wins`}`);
+    queueReplay(win.id, field.flag, `${win.name} takes the flag`, 4);
     audio.cue('lap');
   }
   if (field.over && $('results').hidden && !resultsClosed) showResults();
@@ -508,7 +637,8 @@ function updateField() {
     if (e.id !== 'hero') syncMesh(e.mesh, e.sim.drone);
     const p = e.sim.drone.pos;
     e.label.position.set(p[0], p[1] + 1.1, p[2]);
-    e.label.visible = e.id !== followId || camMode === 'orbit';
+    e.label.scale.set(0.15 * labelZoom, 0.0375 * labelZoom, 1);
+    e.label.visible = e.id !== followId || camMode === 'orbit' || (tvOn() && tvShot?.kind !== 'onboard' && tvShot?.kind !== 'chase');
   }
   if (frameNo % 6 === 0) updateBoard();
 }
@@ -520,7 +650,10 @@ function updateBoard() {
   const rows = standings(field, n);
   const lead = rows[0];
   if (lead.gates && lead.id !== lastLeader) {
-    if (lastLeader !== null) toast(`${lead.name} takes the lead`);
+    if (lastLeader !== null) {
+      toast(`${lead.name} takes the lead`);
+      queueReplay(lead.id, sim.t, `${lead.name} takes the lead`, 2);
+    }
     lastLeader = lead.id;
   }
   const color = Object.fromEntries(field.entries.map((e) => [e.id, e.color]));
@@ -545,6 +678,13 @@ function updateBoard() {
 $('board').addEventListener('click', (e) => {
   const row = e.target.closest('.row');
   if (!row || !field) return;
+  if (tvOn() && director) {
+    // TV: keep cutting between cameras, but all on this drone (tap it again: director's choice)
+    const id = director.pin === row.dataset.id ? null : row.dataset.id;
+    pinSubject(director, id);
+    toast(id ? `TV: following ${field.entries.find((e) => e.id === id).name}` : "TV: director's choice");
+    return;
+  }
   setFollow(row.dataset.id);
   boardHtml = '';
   updateBoard();
@@ -919,7 +1059,16 @@ function showNavNote() {
 let timeScale = 1;
 $('b-cam').onclick = () => {
   camMode = CAM_MODES[(CAM_MODES.indexOf(camMode) + 1) % CAM_MODES.length];
-  $('b-cam').textContent = `Camera: ${camMode === 'fpv' ? 'onboard' : camMode}`;
+  syncButtons();
+  writeHash();
+  if (!tvOn()) {
+    stopReplay();
+    tvShot = null;
+    if (field && director?.pin) setFollow(director.pin);
+  } else {
+    if (director) { director.shot = null; tvSeen = new Map(); }
+    toast('TV: cameras and replays');
+  }
 };
 $('b-speed').onclick = () => {
   timeScale = timeScale === 1 ? 2 : timeScale === 2 ? 4 : 1;
@@ -983,6 +1132,8 @@ $('b-share').onclick = () => {
 };
 const NAV_LABELS = { truth: 'ground truth', vision: 'vision', vio: 'vision + IMU', blind: 'map only' };
 function syncButtons() {
+  $('b-cam').textContent = `Camera: ${CAM_LABELS[camMode]}`;
+  $('b-cam').classList.toggle('on', camMode === 'tv');
   $('b-diff').textContent = `Course: ${difficulty}`;
   $('b-nav').textContent = `Nav: ${NAV_LABELS[nav]}`;
   $('b-eyes').hidden = !hasCamera();
@@ -1012,10 +1163,12 @@ function readHash() {
   pilot = PILOTS.includes(p.get('pilot')) ? p.get('pilot') : 'racing';
   fieldOn = p.get('field') === '1';
   night = p.get('night') === '1';
+  if (p.get('cam') === 'tv') camMode = 'tv';
+  else if (camMode === 'tv') { camMode = 'chase'; stopReplay(); }
   syncButtons();
 }
 function writeHash() {
-  const h = `#seed=${seed}&d=${difficulty}${nav === 'truth' ? '' : `&nav=${nav}`}${eyes === 'pixels' && hasCamera() ? '&eyes=px' : ''}${windMode === 'off' ? '' : `&wind=${windMode}`}${pilot === 'racing' ? '' : `&pilot=${pilot}`}${fieldOn ? '&field=1' : ''}${night ? '&night=1' : ''}`;
+  const h = `#seed=${seed}&d=${difficulty}${nav === 'truth' ? '' : `&nav=${nav}`}${eyes === 'pixels' && hasCamera() ? '&eyes=px' : ''}${windMode === 'off' ? '' : `&wind=${windMode}`}${pilot === 'racing' ? '' : `&pilot=${pilot}`}${fieldOn ? '&field=1' : ''}${night ? '&night=1' : ''}${camMode === 'tv' ? '&cam=tv' : ''}`;
   if (location.hash !== h) history.replaceState(null, '', h);
 }
 addEventListener('hashchange', () => {
@@ -1117,7 +1270,8 @@ addEventListener('keydown', (e) => {
   if (e.key === 't') $('b-tm').click();
   if (e.key === 'g') $('b-ghost').click();
   if (e.key === 'f') $('b-field').click();
-  if (e.key === 'Escape' && !$('results').hidden) $('res-close').click();
+  if (e.key === 'Escape' && replay) stopReplay();
+  else if (e.key === 'Escape' && !$('results').hidden) $('res-close').click();
   if (e.key === 'l') $('b-night').click();
   if (e.key === 'm') $('b-sound').click();
 });
@@ -1196,7 +1350,7 @@ function drawOverlay(rect, label, eyeRect = null) {
   octx.setTransform(1, 0, 0, 1, 0, 0);
   octx.clearRect(0, 0, overlay.width, overlay.height);
   overlayDrawn = !!frame;
-  if (!frame) return;
+  if (!frame || (!rect && !eyeRect)) { overlayDrawn = false; return; }
   octx.setTransform(overlayDpr, 0, 0, overlayDpr, 0, 0);
   let found = 0;
   const fresh = vs.t - frame.t < 0.2;
@@ -1297,7 +1451,26 @@ function updateCameras(dtFrame) {
     const a = performance.now() * 0.00006;
     chaseCam.position.lerp(new THREE.Vector3(Math.cos(a) * 95, 55, Math.sin(a) * 95), k * 0.5);
     chaseCam.lookAt(0, 4, 0);
+  } else if (camMode === 'tv') {
+    if (!director) buildDirector();
+    tvShot = direct(director, tvSubjects(), dtFrame, replay ? TV.replay.speed : timeScale);
+    if (field && tvShot.subject !== followId && field.entries.some((e) => e.id === tvShot.subject)) setFollow(tvShot.subject);
+    if (tvShot.pos) {
+      chaseCam.position.set(...tvShot.pos);
+      chaseCam.lookAt(...tvShot.look);
+    }
   }
+  // the director frames for a landscape picture: on a portrait screen keep the same width
+  // in shot (so a telephoto close-up isn't cropped to the middle of the drone)
+  let fov = camMode === 'tv' && tvShot?.pos ? tvShot.fov : CHASE_FOV;
+  const aspect = innerWidth / innerHeight;
+  if (fov !== CHASE_FOV && aspect < 16 / 9) fov = Math.min(80, 2 * Math.atan(Math.tan(fov * Math.PI / 360) * (16 / 9) / aspect) * 180 / Math.PI);
+  if (Math.abs(chaseCam.fov - fov) > 1e-3) {
+    chaseCam.fov = fov;
+    chaseCam.updateProjectionMatrix();
+  }
+  // name tags keep their size on screen whatever the zoom
+  labelZoom = Math.tan(fov * Math.PI / 360) / Math.tan(CHASE_FOV * Math.PI / 360);
   camMount.getWorldPosition(fpvCam.position);
   camMount.getWorldQuaternion(fpvCam.quaternion);
   fpvCam.rotateY(Math.PI); // three.js cameras look down -Z; the drone's nose is +Z
@@ -1309,6 +1482,7 @@ function frame(now) {
   last = now;
   acc += dtFrame * timeScale;
   if (pilot === 'manual') sim.stick = readSticks(dtFrame);
+  if (replay) acc = 0; // the race waits while the replay plays
   let steps = 0;
   while (acc >= DT && steps < 1200) {
     if (field) shareTraffic(fieldSims);
@@ -1324,6 +1498,11 @@ function frame(now) {
     if (++steps % 6 === 0) pushTrail(sim.drone.pos);
   }
 
+  if (tvOn() && !replay && steps) {
+    if (!director) buildDirector();
+    recordReplay(replayBuf, sim.t, tvEntries());
+    tvWatch();
+  }
   syncDrone();
   if (rival) {
     syncRace(race, sim, rival);
@@ -1337,10 +1516,13 @@ function frame(now) {
   updateDebris(steps * DT);
   updateWash(steps * DT);
   updateHeadlight();
-  { const vs = viewSim(); audio.update(motorTone(vs.drone, { crashed: !!vs.crash })); }
+  if (replay) applyReplay(dtFrame);
+  trail.visible = !replay;
+  { const vs = viewSim(); audio.update(motorTone(vs.drone, { crashed: !!vs.crash || !!replay })); }
   propSpin += dtFrame * 60;
   updateCameras(dtFrame);
   updateHud();
+  updateTvGraphics(innerHeight);
   if ((rival ?? sim).planVersion !== lineVersion) drawRacingLine();
   if (!$('telemetry').hidden && frameNo % 2 === 0) drawTelemetry(telemetry, sim);
   ghosts.forEach((g, i) => g.position.set(...sim.belief.gates[i].pos));
@@ -1360,7 +1542,8 @@ function frame(now) {
   const pip = { x, top: H - y - h, w, h };
   const eyeOn = !!viewSim().vision?.eye;
   const lbl = $('fpv-label');
-  if (camMode === 'fpv') {
+  const onboardView = camMode === 'fpv' || (tvOn() && tvShot?.kind === 'onboard' && !replay);
+  if (onboardView) {
     fpvCam.aspect = W / H;
     fpvCam.updateProjectionMatrix();
     const vm = viewMesh();
@@ -1370,7 +1553,8 @@ function frame(now) {
     drawOverlay({ x: 0, top: 0, w: W, h: H }, W >= 700 ? { x: W / 2 - 56, y: 16 } : null, eyeOn ? pip : null);
   } else {
     renderer.render(scene, chaseCam);
-    if (!eyeOn) {
+    if (replay) drawOverlay(null, null, null);
+    else if (!eyeOn) {
       fpvCam.aspect = w / h;
       fpvCam.updateProjectionMatrix();
       renderer.setScissorTest(true);
@@ -1381,9 +1565,9 @@ function frame(now) {
       renderer.render(scene, fpvCam);
       vm.visible = true;
     }
-    drawOverlay(eyeOn ? null : pip, w >= 180 ? { x: x + 6, y: H - y - h + 6 } : null, eyeOn ? pip : null);
+    if (!replay) drawOverlay(eyeOn ? null : pip, w >= 180 ? { x: x + 6, y: H - y - h + 6 } : null, eyeOn ? pip : null);
   }
-  lbl.style.display = camMode === 'fpv' && !eyeOn ? 'none' : 'block';
+  lbl.style.display = (onboardView && !eyeOn) || replay ? 'none' : 'block';
   lbl.style.bottom = `${y + h + 4}px`;
   const lblText = eyeOn ? (w >= 240 ? "Drone's eye · 320×180 pixels" : "Drone's eye") : 'Onboard camera';
   if (lbl.textContent !== lblText) lbl.textContent = lblText;

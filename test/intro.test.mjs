@@ -99,7 +99,7 @@ test('every quick start is a valid shareable course', () => {
     assert.ok(!ids.has(q.id)); ids.add(q.id);
     assert.ok(q.title && q.text);
     const p = new URLSearchParams(q.hash.replace(/^#/, ''));
-    const known = new Set(['seed', 'd', 'nav', 'eyes', 'wind', 'pilot', 'field', 'night']);
+    const known = new Set(['seed', 'd', 'nav', 'eyes', 'wind', 'pilot', 'field', 'night', 'cam']);
     for (const k of p.keys()) assert.ok(known.has(k), `${q.id}: unknown key ${k}`);
     assert.ok(Number.isInteger(+p.get('seed')) && +p.get('seed') > 0);
     assert.ok(DIFFICULTIES.includes(p.get('d')));
@@ -108,6 +108,7 @@ test('every quick start is a valid shareable course', () => {
     if (p.has('eyes')) { assert.equal(p.get('eyes'), 'px'); assert.ok(['vision', 'vio'].includes(p.get('nav')), `${q.id}: eyes without a camera`); }
     if (p.has('pilot')) assert.ok(PILOTS.includes(p.get('pilot')));
     if (p.has('field')) assert.equal(p.get('field'), '1');
+    if (p.has('cam')) assert.equal(p.get('cam'), 'tv');
     if (p.has('night')) assert.equal(p.get('night'), '1');
   }
 });
