@@ -303,7 +303,7 @@ export function planRacingLine(course, opts = {}) {
 export const SHAPING = { maxOffset: 0.6, rounds: 3, k: [0.6, 1.8], minY: 1.8, coarse: { steps: 80, ds: 0.6 } };
 const shapeCache = new Map();
 // start/rounds/stepScale allow a quick warm-started refinement of an existing shape.
-export function optimiseLine(course, key, { start = null, rounds = SHAPING.rounds, stepScale = 1, plan = {} } = {}) {
+export function optimiseLine(course, key, { start = null, rounds = SHAPING.rounds, stepScale = 1, plan = {}, maxOffset = SHAPING.maxOffset } = {}) {
   if (key && shapeCache.has(key)) return shapeCache.get(key).map((sh) => ({ ...sh }));
   const n = course.gates.length, S = SHAPING;
   const shape = course.gates.map((_, i) => ({ dr: 0, du: 0, k: 1, ...start?.[i] }));
@@ -312,7 +312,8 @@ export function optimiseLine(course, key, { start = null, rounds = SHAPING.round
     return p.minY < S.minY ? Infinity : p.lapTime;
   };
   const step = { dr: 0.3 * stepScale, du: 0.3 * stepScale, k: 0.2 * stepScale };
-  const lim = { dr: [-S.maxOffset, S.maxOffset], du: [-S.maxOffset, S.maxOffset], k: S.k };
+  const lim = { dr: [-maxOffset, maxOffset], du: [-maxOffset, maxOffset], k: S.k };
+  for (const sh of shape) { sh.dr = Math.max(-maxOffset, Math.min(maxOffset, sh.dr)); sh.du = Math.max(-maxOffset, Math.min(maxOffset, sh.du)); }
   let best = cost();
   for (let r = 0; r < rounds; r++) {
     // the start gate is crossed mid-launch, so it keeps the centre line
@@ -435,9 +436,132 @@ export function racingPilot(sim) {
   let a = v3.add(v3.scale(qa.kv, vRef * vRef), v3.scale(qa.t, atRef));
   a = v3.add(a, v3.scale(velRef, DRONE.drag));
   const ref = tr ? v3.add(q.p, tr.off) : q.p;
+  const L = sim.learn;
+  if (L) {
+    // what it learned on earlier laps about this stretch of line
+    // (learned at racing speed: below it, mostly cornering force it doesn't need, so it
+    // fades with the square of the speed, as that force does)
+    const c = L.c, k = 3 * track.idx, f = qa.v > 0 ? Math.min(1, vRef / qa.v) ** 2 : 0;
+    a = [a[0] + f * c[k], a[1] + f * c[k + 1], a[2] + f * c[k + 2]];
+    // and note how this lap goes, unless it isn't flying the plan (launch, a stop, traffic)
+    if (vRef >= qa.v - 0.3 && !(tr && v3.len(tr.off) > 0.05) && !sim.respawnHold) learnRecord(L, track.idx, v3.sub(ref, drone.pos), q.t);
+  }
   a = v3.add(a, v3.scale(v3.sub(ref, drone.pos), P.kp));
   a = v3.add(a, v3.scale(v3.sub(velRef, drone.vel), P.kd));
   return v3.add(a, [0, G, 0]);
+}
+
+// ---------- learning: iterative learning control ----------
+// The racing pilot flies the same line lap after lap, so its tracking errors repeat: the
+// same lag into the same corner, the same drift on the same crest. Iterative learning
+// control (ILC) turns that into a feedforward correction: after each lap, at every point of
+// the line, it adds a share of what the PD loop had to push there (kp * position error +
+// kd * velocity error), taken from a little further along the line (the lead: a command
+// shows up as position a moment later), then smooths the result along the line (the
+// Q-filter that keeps ILC stable).
+export const LEARN = {
+  gain: 0.8, // share of the measured correction learned each lap
+  lead: 0.15, // s, how far ahead the error is taken from
+  smooth: 1.2, // m, sigma of the Gaussian Q-filter along the line
+  max: 8, // m/s^2, largest correction
+  // Once it flies its line accurately, the margins kept for tracking error can go: each
+  // clean, accurate lap raises its confidence a step (0 to 1), which hands the planner more
+  // of the envelope and lets the line cross gates nearer the frame. A sloppy lap backs off.
+  step: 0.25,
+  push: { turnMargin: 0.13, comboMargin: 0.08, aAccel: 2, aBrake: 2, offset: 0.3 },
+  okRms: 0.15, // m, tracking error (RMS) a lap must stay under to step up...
+  okGate: 0.25, // m, ...and the worst miss of a planned gate crossing
+  badGate: 0.4, // m, a crossing this far out (or a miss or crash) steps back down
+};
+export function makeLearner(sim) {
+  const N = sim.plan.pts.length;
+  return {
+    N, c: new Float64Array(3 * N), e: new Float64Array(3 * N), n: new Float64Array(N), sat: new Float64Array(N), last: -1,
+    sq: 0, cnt: 0, gate: 0, bad: false, crashed: false, replan: false, conf: 0, ceil: 1, base: { ...sim.planOpts }, laps: [],
+  };
+}
+function learnRecord(L, k, ep, t) {
+  const j = 3 * k, a = v3.dot(ep, t);
+  // only the error square to the line (along it, the nearest sample is a step away anyway)
+  ep = [ep[0] - a * t[0], ep[1] - a * t[1], ep[2] - a * t[2]];
+  for (let i = 0; i < 3; i++) L.e[j + i] += RACING.kp * ep[i];
+  L.n[k]++;
+  L.last = k;
+  L.sq += ep[0] * ep[0] + ep[1] * ep[1] + ep[2] * ep[2];
+  L.cnt++;
+}
+// The planner options for a confidence level.
+export function learnedOpts(base, conf) {
+  const D = LEARN.push;
+  return {
+    ...base,
+    turnMargin: (base.turnMargin ?? RACING.turnMargin) + D.turnMargin * conf,
+    comboMargin: (base.comboMargin ?? RACING.comboMargin) + D.comboMargin * conf,
+    aAccel: (base.aAccel ?? RACING.aAccel) + D.aAccel * conf,
+    aBrake: (base.aBrake ?? RACING.aBrake) + D.aBrake * conf,
+  };
+}
+// Carry a learned correction over to a re-planned line: each gate-to-gate leg maps onto
+// the same leg of the new line, in proportion.
+function remapLearner(L, from, to) {
+  const n = from.gateS.length, N = to.pts.length, c = new Float64Array(3 * N);
+  const leg = (P, s) => {
+    for (let i = 0; i < n; i++) {
+      const a = P.gateS[i], b = i + 1 < n ? P.gateS[i + 1] : P.gateS[0] + P.length;
+      const x = s < a ? s + P.length : s;
+      if (x >= a && x < b) return [i, (x - a) / (b - a)];
+    }
+    return [0, 0];
+  };
+  for (let k = 0; k < N; k++) {
+    const [i, f] = leg(to, to.pts[k].s);
+    const a = from.gateS[i], b = i + 1 < n ? from.gateS[i + 1] : from.gateS[0] + from.length;
+    const j = Math.round((a + f * (b - a)) / from.ds) % from.pts.length;
+    for (let d = 0; d < 3; d++) c[3 * k + d] = L.c[3 * j + d];
+  }
+  L.N = N; L.c = c; L.e = new Float64Array(3 * N); L.n = new Float64Array(N); L.sat = new Float64Array(N); L.last = -1;
+}
+export function learnLap(sim) {
+  const L = sim.learn, plan = sim.plan, N = L.N, ds = plan.ds;
+  const rms = L.cnt ? Math.sqrt(L.sq / L.cnt) : Infinity;
+  const raw = new Float64Array(3 * N);
+  for (let k = 0; k < N; k++) {
+    const lead = Math.round((plan.pts[k].v * LEARN.lead) / ds), m = (k + lead) % N;
+    // (where the airframe was at its limits, more command can't help: hold, don't wind up)
+    if (!L.n[m] || L.sat[m] > 0.3 * L.n[m]) { for (let i = 0; i < 3; i++) raw[3 * k + i] = L.c[3 * k + i]; continue; }
+    for (let i = 0; i < 3; i++) raw[3 * k + i] = L.c[3 * k + i] + LEARN.gain * L.e[3 * m + i] / L.n[m];
+  }
+  // Q-filter: Gaussian smoothing round the loop
+  const sig = LEARN.smooth / ds, R = Math.ceil(3 * sig), w = [];
+  for (let o = -R; o <= R; o++) w.push(Math.exp(-0.5 * (o / sig) ** 2));
+  const wsum = w.reduce((x, y) => x + y, 0);
+  for (let k = 0; k < N; k++) {
+    let x = 0, y = 0, z = 0;
+    for (let o = -R; o <= R; o++) {
+      const j = 3 * ((k + o + N) % N), ww = w[o + R];
+      x += ww * raw[j]; y += ww * raw[j + 1]; z += ww * raw[j + 2];
+    }
+    const c = v3.clampLen([x / wsum, y / wsum, z / wsum], LEARN.max);
+    L.c[3 * k] = c[0]; L.c[3 * k + 1] = c[1]; L.c[3 * k + 2] = c[2];
+  }
+  // how did that lap go? step the confidence up or down, and re-plan if it moved
+  const before = L.conf;
+  if (L.crashed) { /* already backed off at the crash */ } else if (L.bad || L.gate > LEARN.badGate) L.conf = Math.max(0, L.conf - LEARN.step);
+  else if (rms < LEARN.okRms && L.gate < LEARN.okGate) L.conf = Math.min(L.ceil, L.conf + LEARN.step);
+  L.laps.push({ rms, gate: L.gate, bad: L.bad, conf: L.conf });
+  sim.events.push({ t: sim.t, type: 'learn', rms, gate: L.gate, conf: L.conf, step: Math.sign(L.conf - before) });
+  L.e.fill(0); L.n.fill(0); L.sat.fill(0); L.sq = 0; L.cnt = 0; L.gate = 0; L.bad = false; L.crashed = false;
+  if (L.conf !== before) learnReplan(sim);
+}
+function learnReplan(sim) {
+  const L = sim.learn, old = sim.plan, s = old.pts[sim.track.idx].s;
+  sim.planOpts = learnedOpts(L.base, L.conf);
+  sim.shape = optimiseLine(sim.belief ?? sim.course, null, { start: sim.shape, rounds: 2, stepScale: 0.5, plan: sim.planOpts, maxOffset: SHAPING.maxOffset + LEARN.push.offset * L.conf });
+  const plan = planRacingLine(sim.belief ?? sim.course, { ...sim.planOpts, shape: shapeFor(sim) });
+  remapLearner(L, old, plan);
+  sim.plan = plan;
+  sim.track.idx = nearestIndex(plan, navState(sim).pos, Math.round(s / plan.ds) % plan.pts.length, 60, 60);
+  sim.planVersion++;
 }
 
 // Racecraft. sim.traffic (set each step by whoever runs a multi-drone race) lists the other
@@ -916,6 +1040,7 @@ function shapeFor(sim) {
 function replan(sim) {
   const V = sim.vision, s = sim.plan.pts[sim.track.idx].s;
   const plan = planRacingLine(sim.belief, { ...sim.planOpts, shape: shapeFor(sim) });
+  if (sim.learn) remapLearner(sim.learn, sim.plan, plan);
   sim.plan = plan;
   sim.track.idx = nearestIndex(plan, navState(sim).pos, Math.round(s / plan.ds) % plan.pts.length, 60, 60);
   sim.planVersion++;
@@ -1347,6 +1472,15 @@ function startCrash(sim, hit, vn) {
   d.tumble = { axis, angle: 0, rate: Math.min(22, 4 + 1.5 * Math.abs(vn)) };
   sim.crash = { t: sim.t, until: sim.t + CRASH.tumble, what: hit.what, gate: hit.gate, speed: Math.abs(vn) };
   sim.state.crashes++;
+  if (sim.learn) {
+    // pushed too hard: back off now (the new line is planned at the respawn), not at the lap
+    const L = sim.learn;
+    L.bad = true;
+    // and that level was too much for this course: never go back up to it
+    if (!L.crashed) L.ceil = Math.max(0, L.conf - LEARN.step);
+    if (L.conf > L.ceil) { L.conf = L.ceil; L.replan = true; }
+    L.crashed = true;
+  }
   sim.events.push({ t: sim.t, type: 'crash', what: hit.what, gate: hit.gate, speed: Math.abs(vn), pos: d.pos.slice() });
 }
 
@@ -1415,6 +1549,11 @@ function respawn(sim) {
     E.dr = { p: [E.x[0], E.x[1], E.x[2]], v: [0, 0, 0], b: [E.x[6], E.x[7], E.x[8]] };
   }
   sim.track.idx = nearestIndex(plan, d.pos, 0, 0, N);
+  if (sim.learn?.replan) {
+    sim.learn.replan = false;
+    learnReplan(sim);
+    sim.events.push({ t: sim.t, type: 'learn', rms: null, gate: null, conf: sim.learn.conf, step: -1 });
+  }
   sim.crash = null;
   sim.respawnAt = sim.t + CRASH.hold;
   sim.events.push({ t: sim.t, type: 'respawn' });
@@ -1519,7 +1658,7 @@ export const GRID = { spacing: 2.2 };
 export function gridOffset(slot) {
   return slot ? (slot % 2 ? -1 : 1) * Math.ceil(slot / 2) * GRID.spacing : 0;
 }
-export function makeSim({ seed = 1, gates, pilot = 'racing', difficulty = 'normal', nav = 'truth', optimise = true, wind = 'off', observer = true, launchAt = null, crashes, tune = null, slot = 0, eyes = 'model' } = {}) {
+export function makeSim({ seed = 1, gates, pilot = 'racing', difficulty = 'normal', nav = 'truth', optimise = true, wind = 'off', observer = true, launchAt = null, crashes, tune = null, slot = 0, eyes = 'model', learn = false } = {}) {
   const course = makeCourse({ seed, gates, difficulty });
   const scenery = makeScenery(course, seed);
   if (!NAV_MODES.includes(nav)) nav = 'truth';
@@ -1594,6 +1733,9 @@ export function makeSim({ seed = 1, gates, pilot = 'racing', difficulty = 'norma
     events: [],
   };
   sim.est = nav === 'vio' ? makeEstimator(sim, seed) : null; // visual-inertial navigation filter
+  // learning from its own laps (iterative learning control): the racing pilot, flying on
+  // ground truth, the line shaped for speed
+  sim.learn = learn && pilot === 'racing' && nav === 'truth' && sim.shape ? makeLearner(sim) : null;
   if (sim.eyes === 'pixels' && sim.shape) {
     // nothing seen yet: start on a line through the centre of every mapped gate
     sim.plan = planRacingLine(belief, { ...planOpts, shape: shapeFor(sim) });
@@ -1611,7 +1753,12 @@ export function step(sim, dt) {
         : sim.pilot === 'manual' ? manualPilot(sim, dt)
           : racingPilot(sim);
   // cancel the disturbance the observer has measured (wind, mostly)
-  const cmd = limitThrust(sim.wind && sim.observer && sim.t >= sim.launchAt ? v3.sub(want, sim.dist) : want);
+  const raw = sim.wind && sim.observer && sim.t >= sim.launchAt ? v3.sub(want, sim.dist) : want;
+  const cmd = limitThrust(raw);
+  if (sim.learn && sim.learn.last >= 0) {
+    if (v3.len(v3.sub(raw, cmd)) > 0.5) sim.learn.sat[sim.learn.last]++;
+    sim.learn.last = -1;
+  }
 
   // first-order lag towards the commanded thrust
   const k = Math.min(1, dt / DRONE.thrustLag);
@@ -1683,6 +1830,11 @@ export function step(sim, dt) {
       Math.abs(v3.dot(off, gate.right)) < GATE_INNER / 2 && Math.abs(v3.dot(off, gate.up)) < GATE_INNER / 2;
     if (inside) {
       state.gatesPassed++;
+      if (sim.learn) {
+        // how far from where it planned to cross (square to the gate)
+        const e = v3.sub(hit, sim.plan.cross[gate.id]);
+        sim.learn.gate = Math.max(sim.learn.gate, v3.len(v3.sub(e, v3.scale(gate.normal, v3.dot(e, gate.normal)))));
+      }
       sim.events.push({ t: sim.t, type: 'gate', gate: gate.id });
       if (gate.id === 0) {
         if (sim.est) {
@@ -1694,6 +1846,7 @@ export function step(sim, dt) {
           const lt = sim.t - state.lapStart;
           state.laps.push(lt);
           sim.events.push({ t: sim.t, type: 'lap', time: lt });
+          if (sim.learn) learnLap(sim);
         }
         state.lapStart = sim.t;
         state.lap++;
@@ -1701,6 +1854,7 @@ export function step(sim, dt) {
       state.target = (state.target + 1) % course.gates.length;
     } else if (Math.abs(a0) < 3) {
       state.misses++;
+      if (sim.learn) sim.learn.bad = true;
       sim.events.push({ t: sim.t, type: 'miss', gate: gate.id });
     }
   }

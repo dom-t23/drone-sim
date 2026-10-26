@@ -94,6 +94,21 @@
     .tm-splits b { font-weight: 600; }
     .tm-splits em { font-style: normal; text-align: right; color: var(--muted); }
     .tm-splits .tm-empty { display: block; color: var(--muted); }
+    .learn { width: 260px; font-size: 12px; padding: 8px 12px 10px; font-variant-numeric: tabular-nums; }
+    .learn-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 4px; }
+    .learn-head span { font-weight: 700; }
+    .learn-head b { color: var(--accent); font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: .06em; }
+    .learn-chart { display: block; width: 100%; height: 52px; }
+    .learn-legend { color: var(--muted); font-size: 10px; display: flex; align-items: center; gap: 4px; margin: 3px 0 4px; }
+    .learn-legend .sw { display: inline-block; width: 10px; margin-left: 6px; }
+    .learn-legend .sw:first-child { margin-left: 0; }
+    .learn-legend .sw.bar { height: 8px; background: #ff8a3d; }
+    .learn-legend .sw.dash { height: 0; border-top: 1px dashed rgba(232,237,245,.7); }
+    .learn-legend .sw.trk { height: 2px; background: #4dd2ff; }
+    .learn-row { display: flex; justify-content: space-between; }
+    .learn-row span { color: var(--muted); }
+    .learn-row b { font-weight: 600; }
+    .learn-row b.ahead { color: var(--ok); }
     .err { position: fixed; inset: 0; display: none; place-items: center; padding: 24px; text-align: center; color: var(--muted); }
     .countdown { position: fixed; top: 38%; left: 50%; transform: translate(-50%, -50%); font-size: 84px; font-weight: 800;
       color: var(--ink); pointer-events: none; text-shadow: 0 4px 24px rgba(0,0,0,.7); font-variant-numeric: tabular-nums; }
@@ -158,6 +173,7 @@
     .intro p { margin: 0 0 14px; color: #c3cedd; }
     .intro-starts { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
     .intro-start { text-align: left; border-radius: 10px; backdrop-filter: none; -webkit-backdrop-filter: none; padding: 10px 12px; display: flex; flex-direction: column; gap: 2px; }
+    .intro-start:last-child:nth-child(odd) { grid-column: span 2; }
     .intro-start b { font-weight: 700; }
     .intro-start span { color: var(--muted); font-size: 12px; }
     .intro-new { margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--line); font-size: 13px; }
@@ -177,8 +193,10 @@
     @media (max-width: 560px) { .intro-card { padding: 16px; } .intro h1 { font-size: 24px; } .intro p { font-size: 13px; } }
     @media (max-width: 560px) { .board { width: 190px; } .board .row { grid-template-columns: 12px 8px 1fr auto; }
       .board .row > em:last-child { display: none; } .board-head small { display: none; } }
+    @media (max-width: 560px) { .toast { font-size: 20px; width: max-content; max-width: calc(100vw - 32px); text-align: center; } }
     @media (max-width: 560px) { .countdown { font-size: 64px; } .pad { width: 110px; height: 110px; } }
-    @media (max-width: 560px) { .title small { display: none; } .stats { font-size: 13px; } .note { font-size: 11px; } .tm { width: 200px; } .tm-chart { height: 30px; } }
+    @media (max-width: 560px) { .title small { display: none; } .stats { font-size: 13px; } .note { font-size: 11px; } .tm { width: 200px; } .tm-chart { height: 30px; }
+      .learn { width: 200px; padding: 6px 10px 8px; } .learn-chart { height: 38px; } .learn-legend { display: none; } }
   </style>
   <script type="importmap">
     { "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }
@@ -191,6 +209,13 @@
       <div class="panel title">Drone Sim<small>Self-flying racer · built overnight by Claude</small><button class="about" id="b-about" title="About and what's new (?)">What's new</button></div>
       <div class="panel note" id="nav-note" hidden></div>
       <div class="panel board" id="board" hidden aria-label="Race standings"></div>
+      <div class="panel learn" id="learn" hidden aria-label="Learning">
+        <div class="learn-head"><span>Learning</span><b id="learn-conf">learning</b></div>
+        <canvas class="learn-chart" id="learn-chart"></canvas>
+        <div class="learn-legend"><span class="sw bar"></span>lap time <span class="sw dash"></span>lap 1 <span class="sw trk"></span>tracking error</div>
+        <div class="learn-row"><span>Saved on lap 1</span><b id="learn-gain">–</b></div>
+        <div class="learn-row"><span>Off its line</span><b id="learn-err">–</b></div>
+      </div>
       <div class="panel tm" id="telemetry" hidden aria-label="Telemetry"></div>
     </div>
     <div class="panel stats" aria-live="polite">
@@ -235,6 +260,7 @@
     <button id="b-nav">Nav: ground truth</button>
     <button id="b-dark" title="Cut the onboard camera for 4 s (B)" hidden>Blackout</button>
     <button id="b-eyes" title="How the camera finds gates: a modelled corner detector, or the real pixels (E)" hidden>Eyes: corner model</button>
+    <button id="b-learn" title="Learn from its own laps: it corrects where it drifted, then pushes harder (K)">Learn: off</button>
     <button id="b-wind">Wind: off</button>
     <button id="b-tm">Telemetry</button>
     <button id="b-ghost" class="on" title="Gold ghost of the best lap (G)">Ghost</button>
@@ -248,7 +274,7 @@
       <button class="intro-x" id="intro-x" aria-label="Close">×</button>
       <div class="intro-kicker">Built overnight by Claude</div>
       <h1 id="intro-title">Drone Sim</h1>
-      <p>A racing drone that flies itself. It plans its own racing line, finds the gates with a camera, works out where it is with a Kalman filter and races a field of rivals. Every feature here was written, tested and shipped by Claude on scheduled overnight runs, with nobody at the keyboard.</p>
+      <p>A racing drone that flies itself. It plans its own racing line, learns from every lap, finds the gates with a camera, works out where it is with a Kalman filter and races a field of rivals. Every feature here was written, tested and shipped by Claude on scheduled overnight runs, with nobody at the keyboard.</p>
       <div class="intro-starts" id="intro-starts"></div>
       <section class="intro-new" id="intro-new" hidden>
         <div class="intro-h">Latest build <span id="intro-date"></span></div>

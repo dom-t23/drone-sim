@@ -6,6 +6,7 @@ export const QUICK_STARTS = [
   { id: 'race', title: 'Watch a race', text: 'Five autopilots, three laps, on TV: trackside cameras and slow-motion replays.', hash: '#seed=1&d=normal&field=1&cam=tv' },
   { id: 'fly', title: 'Fly it yourself', text: 'Race the autopilot and your own gold ghost.', hash: '#seed=2&d=normal&pilot=manual' },
   { id: 'night', title: 'Night race', text: 'A hard course under LED gates, headlights on.', hash: '#seed=3&d=hard&field=1&night=1' },
+  { id: 'learn', title: 'Watch it learn', text: 'Every lap it learns where it drifted, flies the line tighter, then pushes harder.', hash: '#seed=2&d=normal&learn=1' },
   { id: 'vio', title: 'Find its way', text: 'No GPS: it spots the gates in its own camera pixels and tracks itself with a Kalman filter.', hash: '#seed=3&d=hard&nav=vio&eyes=px' },
 ];
 

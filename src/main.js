@@ -9,6 +9,7 @@ import { ROSTER, rosterFor, makeField, syncField, standings, gapText, results, R
 import { motorTone, makeWash, emitWash, stepWash, WASH } from './fx.js';
 import { makeAudio } from './audio.js';
 import { makeLanding } from './landing.js';
+import { learnSummary, learnNote, confLabel, drawLearnChart } from './learn.js';
 
 const DT = 1 / 120;
 const initialHash = location.hash; // before the app writes its own (a plain visit gets the intro)
@@ -67,6 +68,9 @@ let sim, seed = 1, difficulty = 'normal', pilot = 'racing', nav = 'truth', world
 let ghosts = [], lineVersion = -1, windMode = 'off';
 // how the camera finds gates: 'model' (a modelled corner detector) or 'pixels' (vision step 3)
 let eyes = 'model';
+// learn: the racing pilot learns from its own laps (iterative learning control, sim.js)
+let learnOn = false;
+const canLearn = () => pilot === 'racing' && nav === 'truth' && !fieldOn;
 const hasCamera = () => nav === 'vision' || nav === 'vio';
 // manual flight: you fly `sim`, the racing-line autopilot flies `rival` on the same course
 let rival = null, race = null, pb = null;
@@ -266,7 +270,7 @@ function buildWorld() {
 
   const manual = pilot === 'manual';
   // you fly by eye, so your sim knows the true course; the rival uses the chosen nav mode
-  sim = makeSim({ seed, pilot, difficulty, nav: manual ? 'truth' : nav, wind: windMode, launchAt: manual || fieldOn ? COUNTDOWN : null, optimise: !manual, eyes });
+  sim = makeSim({ seed, pilot, difficulty, nav: manual ? 'truth' : nav, wind: windMode, launchAt: manual || fieldOn ? COUNTDOWN : null, optimise: !manual, eyes, learn: learnOn && canLearn() });
   // a race against one rival, unless the whole field is racing
   rival = manual && !fieldOn ? makeSim({ seed, pilot: 'racing', difficulty, nav, wind: windMode, launchAt: COUNTDOWN, eyes }) : null;
   race = rival ? makeRace() : null;
@@ -293,6 +297,8 @@ function buildWorld() {
   drawRacingLine();
   resetTelemetry(telemetry);
   showNavNote();
+  learnDrawn = -1;
+  updateLearn();
 
   // scenery for parallax: scattered pillars away from the course (solid: sim.js owns them)
   const list = sim.scenery.pillars;
@@ -462,6 +468,46 @@ function drawRacingLine() {
   racingLine.visible = pilot !== 'pursuit';
   world.add(racingLine);
   lineVersion = src.planVersion;
+}
+
+// ---------- learning: what it has learned from its own laps ----------
+// Cyan arrows along the line show the learned correction: the extra push (feedforward
+// acceleration) it now gives at each point because that is where it drifted off before.
+const LEARN_ARROW = 0.18; // m drawn per m/s^2 of correction
+const learnArrows = new THREE.LineSegments(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color: '#4dd2ff', transparent: true, opacity: 0.8 }));
+learnArrows.frustumCulled = false;
+scene.add(learnArrows);
+let learnDrawn = -1; // laps learned when last drawn
+function updateLearn() {
+  const L = sim.learn, panel = $('learn');
+  panel.hidden = !L;
+  learnArrows.visible = !!L && !replay;
+  if (!L) { learnDrawn = -1; return; }
+  const done = L.laps.length + 1000 * sim.planVersion;
+  if (done === learnDrawn) return;
+  learnDrawn = done;
+  // arrows: every 6th sample of the line (1.5 m apart)
+  const pts = sim.plan.pts, N = pts.length, stride = 6, pos = new Float32Array(Math.ceil(N / stride) * 6);
+  for (let k = 0, j = 0; k < N; k += stride, j += 6) {
+    const p = pts[k].p, c = L.c;
+    pos.set(p, j);
+    pos.set([p[0] + c[3 * k] * LEARN_ARROW, p[1] + c[3 * k + 1] * LEARN_ARROW, p[2] + c[3 * k + 2] * LEARN_ARROW], j + 3);
+  }
+  learnArrows.geometry.dispose();
+  learnArrows.geometry = new THREE.BufferGeometry();
+  learnArrows.geometry.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  // the panel
+  const sum = learnSummary(sim), cv = $('learn-chart'), dpr = Math.min(devicePixelRatio, 2);
+  const w = cv.clientWidth || 236, h = cv.clientHeight || 52;
+  if (cv.width !== Math.round(w * dpr)) { cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr); }
+  const ctx = cv.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  drawLearnChart(ctx, w, h, sum);
+  $('learn-conf').textContent = confLabel(sum.conf);
+  $('learn-gain').textContent = sum.gain > 0.005 ? `−${sum.gain.toFixed(2)} s` : '–';
+  $('learn-gain').className = sum.gain > 0.005 ? 'ahead' : '';
+  $('learn-err').textContent = sum.rmsLast == null ? '–'
+    : sum.laps.length > 1 ? `${Math.round(sum.rmsFirst * 100)} → ${Math.round(sum.rmsLast * 100)} cm` : `${Math.round(sum.rmsLast * 100)} cm`;
 }
 
 // ---------- drone model ----------
@@ -967,7 +1013,8 @@ function updateHud(force) {
   updateBlackout();
   for (; lastEvents < sim.events.length; lastEvents++) {
     const e = sim.events[lastEvents];
-    if (e.type === 'lap') toast(pilot === 'manual' ? lapToast(e.time) : `Lap ${fmt(e.time)}`);
+    if (e.type === 'lap' && !sim.learn) toast(pilot === 'manual' ? lapToast(e.time) : `Lap ${fmt(e.time)}`);
+    if (e.type === 'learn') toast(learnNote(e, s.laps.at(-1), s.laps[0]));
     if (e.type === 'gate') onGate(e.gate);
     if (e.type === 'gate' || e.type === 'lap' || e.type === 'crash') audio.cue(e.type);
     if (e.type === 'miss') toast(`Missed gate ${e.gate + 1}`, true);
@@ -1107,6 +1154,12 @@ $('b-ghost').onclick = () => {
   $('b-ghost').classList.toggle('on', ghostOn);
   toast(ghostOn ? 'Ghost on' : 'Ghost off');
 };
+$('b-learn').onclick = () => {
+  learnOn = !learnOn;
+  syncButtons();
+  buildWorld();
+  toast(learnOn ? 'Learning from every lap' : 'Learning off');
+};
 $('b-wind').onclick = () => {
   windMode = WIND_MODES[(WIND_MODES.indexOf(windMode) + 1) % WIND_MODES.length];
   syncButtons();
@@ -1140,6 +1193,9 @@ function syncButtons() {
   $('b-eyes').textContent = `Eyes: ${eyes === 'pixels' ? 'pixels' : 'corner model'}`;
   $('b-eyes').classList.toggle('on', eyes === 'pixels');
   $('b-wind').textContent = `Wind: ${windMode}`;
+  $('b-learn').hidden = !canLearn();
+  $('b-learn').textContent = `Learn: ${learnOn ? 'on' : 'off'}`;
+  $('b-learn').classList.toggle('on', learnOn);
   $('b-pilot').textContent = `Pilot: ${PILOT_LABELS[pilot]}`;
   $('b-field').textContent = fieldOn ? `Field: ${1 + rosterFor({ pilot, nav }).length} drones` : 'Field: solo';
   $('b-field').classList.toggle('on', fieldOn);
@@ -1163,16 +1219,17 @@ function readHash() {
   pilot = PILOTS.includes(p.get('pilot')) ? p.get('pilot') : 'racing';
   fieldOn = p.get('field') === '1';
   night = p.get('night') === '1';
+  learnOn = p.get('learn') === '1';
   if (p.get('cam') === 'tv') camMode = 'tv';
   else if (camMode === 'tv') { camMode = 'chase'; stopReplay(); }
   syncButtons();
 }
 function writeHash() {
-  const h = `#seed=${seed}&d=${difficulty}${nav === 'truth' ? '' : `&nav=${nav}`}${eyes === 'pixels' && hasCamera() ? '&eyes=px' : ''}${windMode === 'off' ? '' : `&wind=${windMode}`}${pilot === 'racing' ? '' : `&pilot=${pilot}`}${fieldOn ? '&field=1' : ''}${night ? '&night=1' : ''}${camMode === 'tv' ? '&cam=tv' : ''}`;
+  const h = `#seed=${seed}&d=${difficulty}${nav === 'truth' ? '' : `&nav=${nav}`}${eyes === 'pixels' && hasCamera() ? '&eyes=px' : ''}${windMode === 'off' ? '' : `&wind=${windMode}`}${pilot === 'racing' ? '' : `&pilot=${pilot}`}${fieldOn ? '&field=1' : ''}${night ? '&night=1' : ''}${camMode === 'tv' ? '&cam=tv' : ''}${learnOn && canLearn() ? '&learn=1' : ''}`;
   if (location.hash !== h) history.replaceState(null, '', h);
 }
 addEventListener('hashchange', () => {
-  const key = () => `${seed}/${difficulty}/${nav}/${eyes}/${windMode}/${pilot}/${fieldOn}`;
+  const key = () => `${seed}/${difficulty}/${nav}/${eyes}/${windMode}/${pilot}/${fieldOn}/${learnOn}`;
   const before = key();
   const wasNight = night;
   readHash();
@@ -1267,6 +1324,7 @@ addEventListener('keydown', (e) => {
   if (e.key === 'b' && !$('b-dark').hidden) $('b-dark').click();
   if (e.key === 'e' && !$('b-eyes').hidden) $('b-eyes').click();
   if (e.key === 'w') $('b-wind').click();
+  if (e.key === 'k' && !$('b-learn').hidden) $('b-learn').click();
   if (e.key === 't') $('b-tm').click();
   if (e.key === 'g') $('b-ghost').click();
   if (e.key === 'f') $('b-field').click();
@@ -1524,6 +1582,7 @@ function frame(now) {
   updateHud();
   updateTvGraphics(innerHeight);
   if ((rival ?? sim).planVersion !== lineVersion) drawRacingLine();
+  updateLearn();
   if (!$('telemetry').hidden && frameNo % 2 === 0) drawTelemetry(telemetry, sim);
   ghosts.forEach((g, i) => g.position.set(...sim.belief.gates[i].pos));
 
