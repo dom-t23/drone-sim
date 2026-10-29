@@ -60,7 +60,8 @@ export function recordGhost(rec, sim) {
 }
 
 function sampleOf(d) {
-  const T = d.thrust, l = Math.hypot(T[0], T[1], T[2]) || 1;
+  // the body's up axis: along the thrust, except while it rolls inverted in a split-S
+  const T = d.up ?? d.thrust, l = Math.hypot(T[0], T[1], T[2]) || 1;
   const tb = d.tumble, a = tb ? tb.angle : 0;
   const ax = tb ? tb.axis : [0, 0, 0];
   return [d.pos[0], d.pos[1], d.pos[2], d.yaw, T[0] / l, T[1] / l, T[2] / l, ax[0] * a, ax[1] * a, ax[2] * a];
@@ -83,10 +84,12 @@ export function ghostPose(g, t) {
   const at = (k) => fr[i * F + k] + (fr[j * F + k] - fr[i * F + k]) * f;
   let dy = fr[j * F + 4] - fr[i * F + 4];
   dy = Math.atan2(Math.sin(dy), Math.cos(dy)); // shortest way round
+  // upside down in a split-S the heading flips round in one step: don't sweep through it
+  const flip = Math.abs(dy) > 2, k = f < 0.5 ? i : j, att = (c) => (flip ? fr[k * F + c] : at(c));
   const pose = {
     pos: [at(1), at(2), at(3)],
-    yaw: fr[i * F + 4] + dy * f,
-    thrust: [at(5), at(6), at(7)],
+    yaw: flip ? fr[k * F + 4] : fr[i * F + 4] + dy * f,
+    thrust: [att(5), att(6), att(7)],
   };
   const l = Math.hypot(...pose.thrust) || 1;
   pose.thrust = pose.thrust.map((x) => x / l);

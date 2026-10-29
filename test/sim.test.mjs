@@ -194,7 +194,8 @@ test('planned line stays clear of the ground and its speed changes fit the envel
         const at = (vn * vn - q.v * q.v) / (2 * plan.ds);
         const a = v3.add(v3.add(v3.scale(q.kv, q.v * q.v), v3.scale(q.t, at + DRONE.drag * q.v)), [0, G, 0]);
         const tilt = Math.acos(a[1] / v3.len(a));
-        assert.ok(tilt <= DRONE.maxTiltRad + 0.02, `${difficulty} seed ${seed}: needs ${(tilt * 57.3).toFixed(1)}° tilt`);
+        // (a pro course's split-S is flown acro: it rolls inverted, so only the thrust counts)
+        assert.ok(q.acro || tilt <= DRONE.maxTiltRad + 0.02, `${difficulty} seed ${seed}: needs ${(tilt * 57.3).toFixed(1)}° tilt`);
         assert.ok(v3.len(a) <= DRONE.maxThrustAcc + 0.5, `${difficulty} seed ${seed}: needs ${v3.len(a).toFixed(1)} m/s² thrust`);
       }
     }
@@ -603,7 +604,8 @@ test('scenery: same pillars every time, none within reach of any racing line', (
     for (const seed of SEEDS) {
       const sim = makeSim({ seed, difficulty });
       assert.deepEqual(makeScenery(sim.course).pillars, sim.scenery.pillars);
-      assert.ok(sim.scenery.pillars.length > 45, `${difficulty} ${seed}: only ${sim.scenery.pillars.length} pillars`);
+      // (a pro course is a long out-and-back, so it clears a few more of them away)
+      assert.ok(sim.scenery.pillars.length > (difficulty === 'pro' ? 40 : 45), `${difficulty} ${seed}: only ${sim.scenery.pillars.length} pillars`);
       let closest = Infinity;
       for (const q of sim.scenery.pillars) {
         for (const pt of sim.plan.pts) {
@@ -1075,8 +1077,9 @@ for (const difficulty of DIFFICULTIES) {
       assert.ok(r.maxRel < 0.75, `seed ${seed}: ${r.maxRel.toFixed(2)} m out relative to the next gate at worst`);
       // the filter knows how sure it is: rarely outside three sigma
       assert.ok(r.outside / r.k < 0.02, `seed ${seed}: outside 3 sigma ${((r.outside / r.k) * 100).toFixed(1)}% of the time`);
-      // the same readings, dead reckoned from each lap's start, stray by metres
-      assert.ok(r.maxDr > 2, `seed ${seed}: dead reckoning only strayed ${r.maxDr.toFixed(1)} m`);
+      // the same readings, dead reckoned from each lap's start, stray by metres (a little
+      // less on a pro course: its laps are shorter, and dead reckoning restarts every lap)
+      assert.ok(r.maxDr > (difficulty === 'pro' ? 1.5 : 2), `seed ${seed}: dead reckoning only strayed ${r.maxDr.toFixed(1)} m`);
       assert.ok(sim.est.stats.updates > 500 && sim.vision.stats.replans > 0);
       // and the bias stays found in flight
       for (let k = 0; k < 3; k++) assert.ok(Math.abs(sim.est.x[6 + k] - sim.est.bias[k]) < 0.1, `seed ${seed}: bias axis ${k} out`);
@@ -1372,7 +1375,7 @@ function fieldRace(seed, difficulty, { traffic = true, laps = RACE.laps, wind = 
 
 test('field race: five drones race three laps to a chequered flag, with a clean, sensible result', () => {
   let contacts = 0, crashes = 0, contactsOff = 0;
-  const cases = [[1, 'normal'], [2, 'normal'], [4, 'normal'], [3, 'easy'], [5, 'hard'], [7, 'hard']];
+  const cases = [[1, 'normal'], [2, 'normal'], [4, 'normal'], [3, 'easy'], [5, 'hard'], [7, 'hard'], [2, 'pro'], [5, 'pro']];
   for (const [seed, d] of cases) {
     const r = fieldRace(seed, d);
     const res = results(r.field);

@@ -177,7 +177,7 @@ function pixelFlight(seed, difficulty, { nav = 'vision', eyes = 'pixels', second
   return r;
 }
 
-for (const [difficulty, seeds] of [['easy', [1, 42]], ['normal', SEEDS], ['hard', [1, 3, 4, 42]]]) {
+for (const [difficulty, seeds] of [['easy', [1, 42]], ['normal', SEEDS], ['hard', [1, 3, 4, 42]], ['pro', [1, 2]]]) {
   test(`pixels (vision): ${difficulty} courses flown cleanly on what the camera really sees`, () => {
     for (const seed of seeds) {
       const r = pixelFlight(seed, difficulty), s = r.sim.state, tag = `seed ${seed}`;
@@ -185,7 +185,7 @@ for (const [difficulty, seeds] of [['easy', [1, 42]], ['normal', SEEDS], ['hard'
       assert.equal(s.crashes, 0, `${tag}: ${s.crashes} crashed`);
       assert.ok(s.laps.length >= 2, `${tag}: ${s.laps.length} laps`);
       // the gates it flies through are where it thinks they are
-      assert.ok(mean(r.estErr) < (difficulty === 'hard' ? 0.12 : 0.08), `${tag}: estimates ${mean(r.estErr).toFixed(3)} m out on average`);
+      assert.ok(mean(r.estErr) < (['hard', 'pro'].includes(difficulty) ? 0.12 : 0.08), `${tag}: estimates ${mean(r.estErr).toFixed(3)} m out on average`);
       assert.ok(Math.max(...r.estErr) < 0.6, `${tag}: a gate passed ${Math.max(...r.estErr).toFixed(2)} m from its estimate`);
       // every quad it put to a gate was that gate, found to about half a pixel
       assert.equal(r.wrong, 0, `${tag}: ${r.wrong} of ${r.assigned} quads put to the wrong gate`);

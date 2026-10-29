@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { makeSim, step, GATE_INNER, v3, DIFFICULTIES, NAV_MODES, WIND_MODES, PILOTS, DRONE, FRAME, navError, shareTraffic, bumpAll, cameraBlackout, cameraDark, EYES } from './sim.js';
+import { makeSim, step, GATE_INNER, v3, bodyAxes, DIFFICULTIES, NAV_MODES, WIND_MODES, PILOTS, DRONE, FRAME, navError, shareTraffic, bumpAll, cameraBlackout, cameraDark, EYES } from './sim.js';
 import { buildScene } from './eye.js';
 import { TV, makeDirector, subjectsOf, direct, pinSubject, replayShot, endReplay, makeReplay, recordReplay, replayPose, replayWindow } from './director.js';
 import { makeRace, syncRace, raceGap } from './race.js';
@@ -345,7 +345,7 @@ function queueReplay(id, te, title, prio) {
   if (replayQueue && replayQueue.prio >= prio) return;
   replayQueue = { id, te, title, prio, at: te + TV.replay.after };
 }
-// New crashes (any drone) and, flying solo, every second lap.
+// New crashes (any drone), split-S manoeuvres and, flying solo, every second lap.
 function tvWatch() {
   for (const e of tvEntries()) {
     const ev = e.sim.events;
@@ -353,6 +353,8 @@ function tvWatch() {
     for (let i = tvSeen.get(e.id); i < ev.length; i++) {
       const x = ev[i];
       if (x.type === 'crash') queueReplay(e.id, x.t, `${e.id === 'hero' && !field ? 'Crash' : `${e.name} crashes`}`, 3);
+      // a split-S (pro courses), slowed right down: the roll to inverted and the pull through
+      if (x.type === 'splits') queueReplay(e.id, x.from + 0.5, `${e.id === 'hero' && !field ? 'Split-S' : `${e.name}: split-S`} · ${x.inverted.toFixed(2)} s upside down`, 2);
       if (x.type === 'lap' && !field && e.sim.state.laps.length % 2 === 0) {
         // flying solo: every second lap, the fastest gate of that lap that is still in the buffer
         let best = null;
@@ -1015,6 +1017,7 @@ function updateHud(force) {
     const e = sim.events[lastEvents];
     if (e.type === 'lap' && !sim.learn) toast(pilot === 'manual' ? lapToast(e.time) : `Lap ${fmt(e.time)}`);
     if (e.type === 'learn') toast(learnNote(e, s.laps.at(-1), s.laps[0]));
+    if (e.type === 'splits') toast(`Split-S · ${e.inverted.toFixed(2)} s upside down`);
     if (e.type === 'gate') onGate(e.gate);
     if (e.type === 'gate' || e.type === 'lap' || e.type === 'crash') audio.cue(e.type);
     if (e.type === 'miss') toast(`Missed gate ${e.gate + 1}`, true);
@@ -1466,19 +1469,19 @@ function drawOverlay(rect, label, eyeRect = null) {
 }
 
 // ---------- main loop ----------
-const tmpV = new THREE.Vector3(), tmpQ = new THREE.Quaternion(), yawQ = new THREE.Quaternion();
-const UP = new THREE.Vector3(0, 1, 0);
 let acc = 0, last = performance.now(), propSpin = 0, frameNo = 0;
 const controls = document.querySelector('.controls');
 let controlsTop = controls.getBoundingClientRect().top;
 
-const spinQ = new THREE.Quaternion(), spinAxis = new THREE.Vector3();
+const spinQ = new THREE.Quaternion(), spinAxis = new THREE.Vector3(), bodyM = new THREE.Matrix4();
+const bX = new THREE.Vector3(), bY = new THREE.Vector3(), bZ = new THREE.Vector3();
 function syncMesh(mesh, d) {
   mesh.position.set(...d.pos);
-  yawQ.setFromAxisAngle(UP, d.yaw);
-  tmpV.set(...v3.norm(d.thrust));
-  tmpQ.setFromUnitVectors(UP, tmpV);
-  mesh.quaternion.copy(tmpQ).multiply(yawQ);
+  // the same body axes the onboard camera uses (in a split-S the body rolls inverted,
+  // which a heading plus a tilt onto the thrust can't describe)
+  const { bx, by, bz } = bodyAxes(d);
+  bodyM.makeBasis(bX.set(...bx), bY.set(...by), bZ.set(...bz));
+  mesh.quaternion.setFromRotationMatrix(bodyM);
   if (d.tumble) {
     // crashed: spin about the axis the impact gave it
     spinQ.setFromAxisAngle(spinAxis.set(...d.tumble.axis), d.tumble.angle);

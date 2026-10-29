@@ -28,7 +28,7 @@ test('line of sight: blocked by a bar, clear through a gate opening and past a p
 });
 
 test('every gate gets a trackside post that is clear of everything and sees its stretch of line', () => {
-  for (const difficulty of ['easy', 'normal', 'hard']) {
+  for (const difficulty of ['easy', 'normal', 'hard', 'pro']) {
     for (const seed of [1, 4, 7, 9]) {
       const s = makeSim({ seed, difficulty });
       const boxes = boxesOf(s), posts = placePosts(s.course, s.plan, boxes);

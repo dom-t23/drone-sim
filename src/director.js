@@ -375,7 +375,7 @@ export function recordReplay(rep, t, entries) {
   for (const e of entries) {
     const d = e.sim.drone;
     poses[e.id] = {
-      pos: d.pos.slice(), vel: d.vel.slice(), yaw: d.yaw, thrust: d.thrust.slice(),
+      pos: d.pos.slice(), vel: d.vel.slice(), yaw: d.yaw, thrust: d.thrust.slice(), up: d.up?.slice() ?? null,
       tumble: d.tumble ? { axis: d.tumble.axis.slice(), angle: d.tumble.angle } : null,
     };
   }
@@ -403,9 +403,15 @@ export function replayPose(rep, id, t) {
   const a = F[lo].poses[id], b = F[hi].poses[id];
   if (!a || !b) return a ?? b ?? null;
   const u = (t - F[lo].t) / (F[hi].t - F[lo].t);
+  // the body's up axis (it differs from the thrust while it rolls inverted in a split-S,
+  // and the heading flips round in one step once it is upside down: don't sweep through it)
+  const upOf = (p) => p.up ?? v3.norm(p.thrust);
+  const flip = Math.abs(lerpAngle(a.yaw, b.yaw, 1) - a.yaw) > 2, near = u < 0.5 ? a : b;
   return {
-    pos: lerp(a.pos, b.pos, u), vel: lerp(a.vel, b.vel, u), yaw: lerpAngle(a.yaw, b.yaw, u),
+    pos: lerp(a.pos, b.pos, u), vel: lerp(a.vel, b.vel, u),
+    yaw: flip ? near.yaw : lerpAngle(a.yaw, b.yaw, u),
     thrust: lerp(a.thrust, b.thrust, u),
+    up: flip ? upOf(near) : v3.norm(lerp(upOf(a), upOf(b), u)),
     tumble: a.tumble && b.tumble ? { axis: a.tumble.axis, angle: a.tumble.angle + (b.tumble.angle - a.tumble.angle) * u } : (u < 0.5 ? a.tumble : b.tumble),
   };
 }

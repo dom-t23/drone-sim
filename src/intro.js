@@ -3,6 +3,7 @@
 
 // One-tap starting points. Each is a URL hash the app already understands.
 export const QUICK_STARTS = [
+  { id: 'splits', title: 'Split-S', text: 'A pro course: it rolls upside down over a gate tower and dives back through the gate beneath. On TV, with slow-motion replays.', hash: '#seed=1&d=pro&cam=tv' },
   { id: 'race', title: 'Watch a race', text: 'Five autopilots, three laps, on TV: trackside cameras and slow-motion replays.', hash: '#seed=1&d=normal&field=1&cam=tv' },
   { id: 'fly', title: 'Fly it yourself', text: 'Race the autopilot and your own gold ghost.', hash: '#seed=2&d=normal&pilot=manual' },
   { id: 'night', title: 'Night race', text: 'A hard course under LED gates, headlights on.', hash: '#seed=3&d=hard&field=1&night=1' },

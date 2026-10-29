@@ -29,7 +29,7 @@ const FRAME_BAR = 0.28; // gate frame bar thickness, metres (FRAME.bar)
 
 // Course presets. 'normal' is the original layout and must stay byte-for-byte the same
 // (tests and shared links depend on it); the others draw extra random numbers after it.
-export const DIFFICULTIES = ['easy', 'normal', 'hard'];
+export const DIFFICULTIES = ['easy', 'normal', 'hard', 'pro'];
 const DEG = Math.PI / 180;
 const MAX_PITCH = 30 * DEG; // steepest gate a course may contain
 
@@ -61,6 +61,8 @@ export function makeCourse({ gates, seed = 1, difficulty = 'normal' } = {}) {
       yaw: (rand() < 0.5 ? -1 : 1) * (10 + 15 * rand()) * DEG,
       pitch: slope < -0.08 ? -(8 + 10 * rand()) * DEG : 0,
     });
+  } else if (difficulty === 'pro') {
+    return proCourse(rand, seed);
   } else {
     count = gates ?? 10;
     curve = (t) => {
@@ -97,6 +99,68 @@ export function makeCourse({ gates, seed = 1, difficulty = 'normal' } = {}) {
   return { gates: list.map(gateFrame), curve, seed, difficulty };
 }
 
+// Pro: a long out-and-back course with a split-S at one end. The way out climbs along one
+// side to the top of a two-storey gate tower; the drone goes through the top gate, dives
+// over and back through the gate directly beneath it, heading the other way, then races
+// back low along the other side and round a climbing hairpin at the far end. The split-S
+// tower is the last pair of gates in the lap, so every lap ends with it.
+export const PRO = {
+  stack: [10.8, 3.7], // m: heights of the tower's top and bottom gate centres (plus up to 0.8)
+};
+function proCourse(rand, seed) {
+  const L = 38 + 8 * rand(); // tower distance from the middle, m
+  const W = 11 + 4 * rand(); // half-width of the course, m
+  const side = rand() < 0.5 ? 1 : -1; // which way round
+  const rot = rand() * Math.PI * 2; // which way the whole course faces
+  const j = () => rand() * 2 - 1;
+  const hi = PRO.stack[0] + 0.8 * rand(), lo = PRO.stack[1] + 0.4 * rand();
+  // [x along, y, z across, may be angled (yawed, and tipped into a dive)] in flight order
+  const raw = [
+    [L - 26 - 3 * rand(), 4 + 0.6 * rand(), 0.55 * W + 1.5 * j(), false], // start gate: level, square
+    [-8 + 3 * j(), 5 + 1.5 * rand(), W + 2 * j(), true],
+    [-L + 9 + 3 * j(), 4 + 1.2 * rand(), 0.85 * W + 1.5 * j(), true],
+    [-L - 7 - 3 * rand(), 6 + 1.5 * rand(), 0.5 * W, false], // the far hairpin: in...
+    [-L - 7 - 3 * rand(), 8 + 1.5 * rand(), -0.5 * W, false], // ...and out, climbing
+    [-L + 10 + 3 * j(), 8.5 + 1.5 * rand(), -W + 2 * j(), true],
+    [-7 + 3 * j(), 5.5 + 1.5 * rand(), -1.05 * W + 1.5 * j(), true], // a dip on the climb
+    [L - 25 + 2 * j(), 9.2 + 1.2 * rand(), -0.55 * W + 1.2 * j(), false],
+    [L, hi, 0, false], // split-S: top gate, flown outwards...
+    [L, lo, 0, false], // ...then the one beneath it, flown back
+  ];
+  const c = Math.cos(rot), s = Math.sin(rot);
+  const place = ([x, y, z]) => [x * c - z * side * s, y, x * s + z * side * c];
+  const pos = raw.map(place);
+  const n = pos.length;
+  // a closed Catmull-Rom curve through the gate centres (scenery keeps clear of it)
+  const curve = (t) => {
+    const u = (((t / (Math.PI * 2)) % 1) + 1) % 1 * n, i = Math.floor(u), f = u - i;
+    const p0 = pos[(i - 1 + n) % n], p1 = pos[i], p2 = pos[(i + 1) % n], p3 = pos[(i + 2) % n];
+    const f2 = f * f, f3 = f2 * f;
+    return [0, 1, 2].map((k) => 0.5 * (2 * p1[k] + (-p0[k] + p2[k]) * f
+      + (2 * p0[k] - 5 * p1[k] + 4 * p2[k] - p3[k]) * f2 + (-p0[k] + 3 * p1[k] - 3 * p2[k] + p3[k]) * f3));
+  };
+  const along = [Math.cos(rot), 0, Math.sin(rot)];
+  const list = pos.map((p, i) => {
+    let normal;
+    if (i === n - 2) normal = along.slice(); // the tower: square to the course's long axis
+    else if (i === n - 1) normal = v3.scale(along, -1);
+    else {
+      const d = v3.sub(pos[(i + 1) % n], pos[(i - 1 + n) % n]);
+      let h = v3.norm([d[0], 0, d[2]]);
+      if (raw[i][3]) {
+        // angled like a hard course's gates, and tipped into a dive where the line drops
+        const yaw = (rand() < 0.5 ? -1 : 1) * (8 + 12 * rand()) * DEG, cy = Math.cos(yaw), sy = Math.sin(yaw);
+        h = [h[0] * cy + h[2] * sy, 0, -h[0] * sy + h[2] * cy];
+        const slope = d[1] / Math.hypot(d[0], d[2]);
+        const th = Math.max(-MAX_PITCH, Math.min(MAX_PITCH, Math.atan(slope) + (slope < -0.05 ? -(6 + 8 * rand()) * DEG : 0)));
+        normal = [h[0] * Math.cos(th), Math.sin(th), h[2] * Math.cos(th)];
+      } else normal = h;
+    }
+    return gateFrame({ id: i, pos: p, normal });
+  });
+  return { gates: list, curve, seed, difficulty: 'pro', splitS: [n - 2, n - 1] };
+}
+
 // In-plane axes of a gate: right is horizontal, up completes the frame.
 function gateFrame(g) {
   const n = g.normal;
@@ -131,7 +195,9 @@ export function makeDrone(course) {
 }
 
 // Limit a desired specific-thrust vector to what the airframe can do.
-export function limitThrust(t) {
+// acro (a split-S): the drone may roll inverted, so only the size of the thrust is limited.
+export function limitThrust(t, acro = false) {
+  if (acro) return v3.clampLen(t, DRONE.maxThrustAcc);
   let mag = v3.len(t);
   const up = mag > 1e-6 ? t[1] / mag : 1;
   let tilt = Math.acos(Math.max(-1, Math.min(1, up)));
@@ -144,6 +210,59 @@ export function limitThrust(t) {
     mag = v3.len(t);
   }
   return v3.clampLen(t, DRONE.maxThrustAcc);
+}
+
+// The split-S, as a pilot flies it: through the top gate upright, a half roll to inverted
+// (the nose stays pointing on), then pull through, nose down and round, so the body's up
+// axis swings from straight down, through backwards, to straight up as it levels out
+// heading the other way. The thrust itself is whatever the tracker asks for (acro: any
+// direction); this is the attitude that delivers it, which the camera and the renderer use.
+// drone.up is the body's up axis while it differs from the thrust; drone.yaw stays the
+// heading (it turns round once the drone is inverted, where that is seamless).
+export const SPLIT_S = { rollRate: 18, pitchRate: 16, hold: 0.02 }; // rad/s, rad/s, rad short of inverted
+function splitSAttitude(sim, acro, dt, upBefore) {
+  const S = SPLIT_S, d = sim.drone;
+  if (!d.flip) {
+    const n = [Math.sin(d.yaw), 0, Math.cos(d.yaw)], r = [n[2], 0, -n[0]]; // r = up x n
+    // the body's up axis now (along the thrust): its tilt from vertical, and which way
+    const u = upBefore, hl = Math.hypot(u[0], u[2]);
+    let h0 = hl > 0.05 ? [u[0] / hl, 0, u[2] / hl] : v3.scale(n, -1);
+    const side = v3.dot(h0, r) < 0 ? -1 : 1; // roll the way it is already leaning
+    d.flip = { n, h0, h1: v3.scale(r, side), t0: Math.acos(Math.max(-1, Math.min(1, u[1]))), phase: 'roll', a: 0,
+      at: sim.t, vIn: v3.len(d.vel), inverted: 0, g: 0 };
+  }
+  const f = d.flip, u = v3.norm(d.thrust);
+  f.g = Math.max(f.g, v3.len(d.thrust) / G);
+  if (f.phase === 'roll' && !acro) { delete d.flip; delete d.up; return; } // cut short (a crash)
+  if ((d.up ?? u)[1] < 0) f.inverted += dt;
+  const pull = () => v3.sub(v3.scale([0, 1, 0], Math.cos(f.a)), v3.scale(f.n, Math.sin(f.a)));
+  if (f.phase === 'roll') {
+    // half roll: the up axis swings from where it leans now, out to the side and over
+    // to straight down, as fast as the airframe rolls
+    f.a = Math.min(Math.PI - S.hold, Math.max(f.a, f.t0) + S.rollRate * dt);
+    const k = Math.min(1, (f.a - f.t0) / Math.max(0.3, Math.PI - S.hold - f.t0)) * Math.PI / 2;
+    const h = v3.norm(v3.add(v3.scale(f.h0, Math.cos(k)), v3.scale(f.h1, Math.sin(k))));
+    d.up = v3.add(v3.scale([0, 1, 0], Math.cos(f.a)), v3.scale(h, Math.sin(f.a)));
+    if (f.a >= Math.PI - S.hold) {
+      // inverted: from here it is described as heading back, pitched over by (almost)
+      // 180 degrees, which is the same attitude
+      f.phase = 'pull';
+      d.yaw = Math.atan2(-f.n[0], -f.n[2]);
+      d.up = pull();
+    }
+  } else {
+    // pull through: the up axis follows the thrust round in the plane of the loop
+    const want = Math.max(0, Math.atan2(-v3.dot(u, f.n), u[1]));
+    const da = Math.max(-S.pitchRate * dt, Math.min(S.pitchRate * dt, want - f.a));
+    f.a = Math.min(Math.PI - S.hold, f.a + da);
+    d.up = pull();
+    // out of the loop, once the body has caught up with the thrust: back to normal flight
+    if (!acro && Math.abs(want - f.a) < 0.05) {
+      sim.events.push({ t: sim.t, type: 'splits', from: f.at, vIn: f.vIn, vOut: v3.len(d.vel), inverted: f.inverted, g: f.g });
+      delete d.flip; delete d.up;
+      return;
+    }
+  }
 }
 
 // ---------- autopilot ----------
@@ -268,11 +387,15 @@ export function planRacingLine(course, opts = {}) {
     // second difference / ds^2 = curvature vector (points towards the turn centre)
     pts[k].kv = v3.scale(v3.add(v3.sub(a, v3.scale(b, 2)), c), 1 / (ds * ds));
   }
+  // a split-S is flown acro: between its two gates the drone may roll inverted, so the
+  // thrust can point any way at all (only its size is limited)
+  const acro = course.splitS;
+  if (acro) for (let k = 0; k < N; k++) pts[k].acro = pts[k].s > gateS[acro[0]] && pts[k].s < gateS[acro[1]];
   // speed profile: turn limit, then forward (accel) and backward (brake) passes, twice round the loop
   // Along-track acceleration and braking share the envelope with the turn (a
   // friction-circle style limit), so a crest or tight corner leaves less for braking.
   const E = envelope(P);
-  const v = pts.map((q) => turnSpeedLimit(q.kv, P, E));
+  const v = pts.map((q) => turnSpeedLimit(q.kv, P, E, q.acro));
   for (let pass = 0; pass < 2; pass++) {
     for (let k = 1; k <= N; k++) {
       const i = k % N, h = k - 1;
@@ -354,8 +477,9 @@ function envelope(P) {
 // Fastest speed at which the turn at curvature vector kv fits inside the airframe's
 // envelope (tilt limit and max thrust), scaled by a safety margin. Diving turns are
 // limited hardest because less vertical thrust means less sideways force at max tilt.
-function turnFeasible(kv, v, E) {
+function turnFeasible(kv, v, E, acro) {
   const v2 = v * v, ax = kv[0] * v2, az = kv[2] * v2, lift = kv[1] * v2 + G;
+  if (acro) return Math.sqrt(ax * ax + az * az + lift * lift) <= E.maxTurn;
   const ty = lift * E.turnMargin; // vertical thrust available
   const th = Math.sqrt(ax * ax + az * az);
   if (ty <= 0) return th < 1e-6 && lift >= 0;
@@ -370,8 +494,9 @@ function alongLimit(q, v, budget, dir, E) {
   const fits = (x) => {
     const at = dir * x + drag; // thrust along the path: the speed change plus beating drag
     const ax = kx + tx * at, ay = ky + ty * at, az = kz + tz * at; // gravity included in ay
-    if (ay <= 0) return false;
     const th = Math.sqrt(ax * ax + az * az);
+    if (q.acro) return Math.sqrt(th * th + ay * ay) <= E.maxCombo;
+    if (ay <= 0) return false;
     return th <= ay * E.tanCombo && Math.sqrt(th * th + ay * ay) <= E.maxCombo;
   };
   let lo = dir > 0 ? 0 : Math.min(budget, drag), hi = budget;
@@ -383,12 +508,12 @@ function alongLimit(q, v, budget, dir, E) {
   }
   return lo;
 }
-function turnSpeedLimit(kv, P, E) {
-  if (turnFeasible(kv, P.vMax, E)) return P.vMax;
+function turnSpeedLimit(kv, P, E, acro) {
+  if (turnFeasible(kv, P.vMax, E, acro)) return P.vMax;
   let lo = 0, hi = P.vMax;
   for (let i = 0; i < 24; i++) {
     const mid = (lo + hi) / 2;
-    if (turnFeasible(kv, mid, E)) lo = mid; else hi = mid;
+    if (turnFeasible(kv, mid, E, acro)) lo = mid; else hi = mid;
   }
   return lo;
 }
@@ -572,7 +697,7 @@ function learnReplan(sim) {
 // squeezed in before every gate, so a pass never costs a frame, and eased in and out.
 // If a slower drone is still in the way, hold back like adaptive cruise control: never
 // close on it faster than braking at TRAFFIC.brake could stop TRAFFIC.gap behind it.
-export const TRAFFIC = { horizon: 1.2, clear: 1.6, dodge: 1.3, max: 2.0, atGate: 0.3, tau: 0.25, range: 15, brake: 8, gap: 1.5, funnel: 15, giveWay: 12 };
+export const TRAFFIC = { horizon: 1.2, clear: 1.6, dodge: 1.3, max: 2.0, atGate: 0.3, tau: 0.25, range: 15, brake: 8, gap: 1.5, headway: 0.12, funnel: 15, giveWay: 12 };
 function dodge(sim, me, qa, speed) {
   const T = TRAFFIC, t = qa.t, dt = 1 / 120;
   let want = [0, 0, 0], vCap = Infinity;
@@ -590,8 +715,9 @@ function dodge(sim, me, qa, speed) {
     const along = v3.dot(r, t), side = v3.len(perp(r));
     if (along > 0 && (side < (toGate < T.funnel ? T.clear + 1.2 : T.clear * 0.9) || miss < T.clear)) {
       // in front and in my way (and before a gate, anywhere in the same opening): don't
-      // close faster than I could stop T.gap behind it, and drop back if I'm closer
-      const d = along - T.gap;
+      // close faster than I could stop T.gap behind it (plus a little headway at speed, in
+      // case it brakes hard: a slow drone in a hairpin can), and drop back if I'm closer
+      const d = along - T.gap - T.headway * speed;
       vCap = Math.min(vCap, Math.max(0, v3.dot(o.vel, t)) + Math.sign(d) * Math.sqrt(2 * T.brake * Math.abs(d)));
     }
     if (miss >= T.clear) continue;
@@ -683,8 +809,12 @@ export function cameraPose(drone) {
 }
 
 // The body axes in world coordinates (x left, y up along the thrust, z out of the nose).
+// In a split-S the body's up axis is drone.up (it rolls inverted ahead of the thrust).
 export function bodyAxes(drone) {
-  const t = v3.norm(drone.thrust), c = t[1];
+  let t = drone.up ?? v3.norm(drone.thrust);
+  // (exactly upside down, the tilt's axis is undefined: lean it a hair along the heading)
+  if (t[1] < -1 + 1e-9) t = v3.norm([1e-4 * Math.sin(drone.yaw), -1, 1e-4 * Math.cos(drone.yaw)]);
+  const c = t[1];
   const tilt = (v) => {
     // rotate v by the minimal rotation taking world up onto t (axis up x t)
     const k = [t[2], 0, -t[0]], kv = k[0] * v[0] + k[2] * v[2];
@@ -855,6 +985,7 @@ const m3 = {
 function makeMap(course, seed) {
   const rand = mulberry32((seed * 7919 + 13) | 0), E = MAP_ERROR;
   return {
+    splitS: course.splitS,
     gates: course.gates.map((g) => {
       const ang = rand() * Math.PI * 2, mag = E.shift[0] + (E.shift[1] - E.shift[0]) * rand();
       const along = (rand() * 2 - 1) * E.along, yaw = (rand() * 2 - 1) * E.yaw;
@@ -1146,7 +1277,7 @@ function imuAccel(sim) {
 function navState(sim) {
   if (!sim.est) return sim.drone;
   const x = sim.est.x;
-  return { pos: [x[0], x[1], x[2]], vel: [x[3], x[4], x[5]], thrust: sim.drone.thrust, yaw: sim.drone.yaw };
+  return { pos: [x[0], x[1], x[2]], vel: [x[3], x[4], x[5]], thrust: sim.drone.thrust, yaw: sim.drone.yaw, up: sim.drone.up };
 }
 
 // P <- T P T' for T = I + (M at rows a, columns b): the state block a gains M times block b.
@@ -1533,6 +1664,13 @@ function respawn(sim) {
     const q = plan.pts[(Math.round((plan.gateS[last] + CRASH.after) / plan.ds) + N) % N];
     d.pos = [q.p[0], Math.max(1.5, q.p[1]), q.p[2]];
     d.yaw = Math.atan2(q.t[0], q.t[2]);
+    if (last === sim.course.splitS?.[0]) {
+      // crashed in a split-S after the top gate: not halfway down the dive, but in front of
+      // the bottom gate, facing it
+      const b = sim.course.gates[sim.course.splitS[1]];
+      d.pos = v3.sub(b.pos, v3.scale(b.normal, 4));
+      d.yaw = Math.atan2(b.normal[0], b.normal[2]);
+    }
   } else {
     d.pos = sim.start.pos.slice();
     d.yaw = sim.start.yaw;
@@ -1540,6 +1678,8 @@ function respawn(sim) {
   d.vel = [0, 0, 0];
   d.thrust = [0, G, 0];
   delete d.tumble;
+  delete d.flip;
+  delete d.up;
   sim.kick = null;
   if (sim.est) {
     // put back by hand: roughly where it should be, and not moving
@@ -1754,13 +1894,15 @@ export function step(sim, dt) {
           : racingPilot(sim);
   // cancel the disturbance the observer has measured (wind, mostly)
   const raw = sim.wind && sim.observer && sim.t >= sim.launchAt ? v3.sub(want, sim.dist) : want;
-  const cmd = limitThrust(raw);
+  const acro = sim.pilot === 'racing' && !!sim.plan.pts[sim.track.idx].acro && sim.t >= sim.launchAt && sim.t >= sim.respawnAt;
+  const cmd = limitThrust(raw, acro);
   if (sim.learn && sim.learn.last >= 0) {
     if (v3.len(v3.sub(raw, cmd)) > 0.5) sim.learn.sat[sim.learn.last]++;
     sim.learn.last = -1;
   }
 
   // first-order lag towards the commanded thrust
+  const upBefore = drone.up ?? v3.norm(drone.thrust);
   const k = Math.min(1, dt / DRONE.thrustLag);
   drone.thrust = v3.add(drone.thrust, v3.scale(v3.sub(cmd, drone.thrust), k));
 
@@ -1807,8 +1949,9 @@ export function step(sim, dt) {
     sim.t += dt;
     return;
   }
+  if (acro || drone.flip) splitSAttitude(sim, acro, dt, upBefore);
   const hs = Math.hypot(drone.vel[0], drone.vel[2]);
-  if (hs > 0.5 && sim.pilot !== 'manual') drone.yaw = Math.atan2(drone.vel[0], drone.vel[2]);
+  if (hs > 0.5 && sim.pilot !== 'manual' && !drone.flip) drone.yaw = Math.atan2(drone.vel[0], drone.vel[2]);
   const V = sim.vision;
   if (V && V.held !== null && hs < 3 && sim.pilot !== 'manual') {
     // stopped short of a gate it can't see: turn to look where it thinks the gate is
